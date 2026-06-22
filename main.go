@@ -15,7 +15,9 @@ import (
 	"encoding/json"
 	"flag"
 	"log"
+	"net"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 
@@ -989,8 +991,14 @@ func (h *hub) handleHealth(w http.ResponseWriter, _ *http.Request) {
 
 // ─── main ─────────────────────────────────────────────────────────────────────
 
+const defaultPort = "8090"
+
 func main() {
-	port := flag.String("port", "8080", "TCP port to listen on")
+	portDefault := os.Getenv("DECODER_PORT")
+	if portDefault == "" {
+		portDefault = defaultPort
+	}
+	port := flag.String("port", portDefault, "TCP port (default from DECODER_PORT env or 8090)")
 	flag.Parse()
 
 	h := newHub()
@@ -1015,12 +1023,18 @@ func main() {
 		MaxHeaderBytes:    1 << 20,
 	}
 
-	log.Printf("Decoder relay server  listening on %s", srv.Addr)
-	log.Printf("  Client stream:  ws://0.0.0.0%s/ws/client", srv.Addr)
-	log.Printf("  Admin viewer:   ws://0.0.0.0%s/ws/admin", srv.Addr)
-	log.Printf("  Client list:    http://0.0.0.0%s/api/clients", srv.Addr)
-	log.Printf("  Presence log:   http://0.0.0.0%s/api/presence", srv.Addr)
-	log.Printf("  Screenshots:    http://0.0.0.0%s/api/screenshots", srv.Addr)
-	log.Printf("  Health:         http://0.0.0.0%s/health", srv.Addr)
-	log.Fatal(srv.ListenAndServe())
+	addr := srv.Addr
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		log.Fatalf("listen tcp %s: %v", addr, err)
+	}
+
+	log.Printf("Decoder relay server  listening on %s", addr)
+	log.Printf("  Client stream:  ws://0.0.0.0%s/ws/client", addr)
+	log.Printf("  Admin viewer:   ws://0.0.0.0%s/ws/admin", addr)
+	log.Printf("  Client list:    http://0.0.0.0%s/api/clients", addr)
+	log.Printf("  Presence log:   http://0.0.0.0%s/api/presence", addr)
+	log.Printf("  Screenshots:    http://0.0.0.0%s/api/screenshots", addr)
+	log.Printf("  Health:         http://0.0.0.0%s/health", addr)
+	log.Fatal(srv.Serve(ln))
 }
