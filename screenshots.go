@@ -42,6 +42,7 @@ type screenshotStore struct {
 	indexPath string
 	seen      map[string]struct{}
 	items     []ScreenshotMeta
+	byID      map[string]ScreenshotMeta // O(1) lookup by screenshot ID
 	ingestCh  chan screenshotIngestJob
 	onSaved   func(ScreenshotMeta)
 }
@@ -59,6 +60,7 @@ func newScreenshotStore(onSaved func(ScreenshotMeta)) *screenshotStore {
 		indexPath: filepath.Join(dir, "screenshots-index.json"),
 		seen:      make(map[string]struct{}),
 		items:     []ScreenshotMeta{},
+		byID:      make(map[string]ScreenshotMeta),
 		ingestCh:  make(chan screenshotIngestJob, screenshotIngestQueue),
 		onSaved:   onSaved,
 	}
@@ -89,6 +91,7 @@ func (s *screenshotStore) load() {
 	s.items = stored
 	for _, item := range stored {
 		s.seen[item.ID] = struct{}{}
+		s.byID[item.ID] = item
 	}
 }
 
@@ -152,6 +155,7 @@ func (s *screenshotStore) process(meta ScreenshotMeta, data []byte) bool {
 
 	s.mu.Lock()
 	s.items = append(s.items, meta)
+	s.byID[meta.ID] = meta
 	s.mu.Unlock()
 	go s.saveIndex()
 
@@ -198,10 +202,8 @@ func (s *screenshotStore) list(clientID string, fromMs, toMs int64) []Screenshot
 func (s *screenshotStore) get(id string) (ScreenshotMeta, string, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	for _, item := range s.items {
-		if item.ID == id {
-			return item, s.filePath(item), true
-		}
+	if item, ok := s.byID[id]; ok {
+		return item, s.filePath(item), true
 	}
 	return ScreenshotMeta{}, "", false
 }

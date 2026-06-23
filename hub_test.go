@@ -9,12 +9,16 @@ import (
 
 func mockAdmin(id string) *adminConn {
 	return &adminConn{
-		id:       id,
-		send:     make(chan wsMsg, sendQueueDepth),
-		done:     make(chan struct{}),
-		watching: make(map[string]struct{}),
+		id:           id,
+		textSend:     make(chan wsMsg, textQueueDepth),
+		done:         make(chan struct{}),
+		watching:     make(map[string]struct{}),
+		latestFrames: make(map[string][]byte),
+		framePoke:    make(chan struct{}, 1),
 	}
 }
+
+// ─── Watch index ──────────────────────────────────────────────────────────────
 
 func TestWatchIndexRouting(t *testing.T) {
 	h := newHub()
@@ -46,6 +50,8 @@ func TestWatchIndexRouting(t *testing.T) {
 	h.mu.RUnlock()
 }
 
+// ─── Frame routing ────────────────────────────────────────────────────────────
+
 func TestRouteFrameConcurrent(t *testing.T) {
 	h := newHub()
 	a := mockAdmin("admin-1")
@@ -72,20 +78,47 @@ func TestRouteFrameConcurrent(t *testing.T) {
 	}
 	wg.Wait()
 
-	received := 0
-drain:
-	for {
-		select {
-		case <-a.send:
-			received++
-		default:
-			break drain
-		}
-	}
-	if received == 0 {
-		t.Fatal("expected at least one frame delivered")
+	// At least one frame should have arrived in the slot.
+	a.frameMu.Lock()
+	frame, ok := a.latestFrames["client-1"]
+	a.frameMu.Unlock()
+	if !ok || len(frame) == 0 {
+		t.Fatal("expected at least one frame in latestFrames")
 	}
 }
+
+// routeFrame builds one copy and shares it — no extra copies per admin.
+func TestRouteFrameOneCopyShared(t *testing.T) {
+	h := newHub()
+	a1 := mockAdmin("admin-1")
+	a2 := mockAdmin("admin-2")
+	h.mu.Lock()
+	h.admins[a1.id] = a1
+	h.admins[a2.id] = a2
+	h.mu.Unlock()
+	h.addAdminWatch(a1, "client-1")
+	h.addAdminWatch(a2, "client-1")
+
+	payload := []byte("JPEG_DATA")
+	h.routeFrame("client-1", payload)
+
+	a1.frameMu.Lock()
+	f1 := a1.latestFrames["client-1"]
+	a1.frameMu.Unlock()
+	a2.frameMu.Lock()
+	f2 := a2.latestFrames["client-1"]
+	a2.frameMu.Unlock()
+
+	if f1 == nil || f2 == nil {
+		t.Fatal("both admins should have the frame")
+	}
+	// Both admins should point to the SAME underlying array (one copy, shared).
+	if &f1[0] != &f2[0] {
+		t.Fatal("expected shared frame slice (one copy), got independent copies")
+	}
+}
+
+// ─── Register / unregister ────────────────────────────────────────────────────
 
 func TestConcurrentRegisterUnregister(t *testing.T) {
 	h := newHub()
@@ -101,7 +134,7 @@ func TestConcurrentRegisterUnregister(t *testing.T) {
 			c := &clientConn{info: info, send: make(chan wsMsg, 4), done: make(chan struct{})}
 			h.registerClient(c)
 			h.routeFrame(id, []byte{1, 2, 3})
-			h.unregisterClient(id)
+			h.unregisterClient(id, c)
 		}(i)
 	}
 	wg.Wait()
@@ -113,6 +146,103 @@ func TestConcurrentRegisterUnregister(t *testing.T) {
 		t.Fatalf("expected 0 clients after unregister, got %d", count)
 	}
 }
+
+func TestReconnectDoesNotEvictNewConn(t *testing.T) {
+	h := newHub()
+	id := "client-reconnect"
+
+	info := ClientInfo{ID: id, Hostname: "host", Username: "user", ConnectedAt: time.Now()}
+	old := &clientConn{info: info, send: make(chan wsMsg, 4), done: make(chan struct{})}
+	h.registerClient(old)
+
+	newer := &clientConn{info: info, send: make(chan wsMsg, 4), done: make(chan struct{})}
+	h.registerClient(newer)
+
+	h.unregisterClient(id, old)
+
+	h.mu.RLock()
+	cur := h.clients[id]
+	h.mu.RUnlock()
+	if cur != newer {
+		t.Fatal("unregisterClient with stale conn evicted the new connection")
+	}
+}
+
+// ─── Latest-frame per-client semantics ────────────────────────────────────────
+
+func TestLatestFrameReplacesPrevious(t *testing.T) {
+	a := mockAdmin("admin-1")
+
+	frame1 := []byte("frame-one")
+	frame2 := []byte("frame-two")
+	frame3 := []byte("frame-three")
+
+	a.enqueueFrame("client-1", frame1)
+	a.enqueueFrame("client-1", frame2)
+	a.enqueueFrame("client-1", frame3)
+
+	a.frameMu.Lock()
+	got := a.latestFrames["client-1"]
+	a.frameMu.Unlock()
+
+	if string(got) != string(frame3) {
+		t.Fatalf("expected frame3, got %s", got)
+	}
+}
+
+func TestLatestFramePerClientIsolated(t *testing.T) {
+	a := mockAdmin("admin-1")
+
+	frameA := []byte("frame-A")
+	frameB := []byte("frame-B")
+
+	a.enqueueFrame("client-A", frameA)
+	a.enqueueFrame("client-B", frameB)
+
+	a.frameMu.Lock()
+	gotA := a.latestFrames["client-A"]
+	gotB := a.latestFrames["client-B"]
+	a.frameMu.Unlock()
+
+	if string(gotA) != string(frameA) {
+		t.Fatalf("client-A: expected %s, got %s", frameA, gotA)
+	}
+	if string(gotB) != string(frameB) {
+		t.Fatalf("client-B: expected %s, got %s", frameB, gotB)
+	}
+}
+
+// ─── Cursor/stats isolation ───────────────────────────────────────────────────
+
+func TestCursorStatsOnlyToWatchers(t *testing.T) {
+	h := newHub()
+	watcher := mockAdmin("watcher")
+	bystander := mockAdmin("bystander")
+
+	h.mu.Lock()
+	h.admins[watcher.id] = watcher
+	h.admins[bystander.id] = bystander
+	h.mu.Unlock()
+
+	h.addAdminWatch(watcher, "client-1")
+
+	payload := []byte(`{"type":"cursor","x":100,"y":200}`)
+	h.broadcastToWatchers("client-1", payload)
+
+	select {
+	case <-watcher.textSend:
+	default:
+		t.Fatal("watcher did not receive cursor message")
+	}
+
+	select {
+	case msg := <-bystander.textSend:
+		t.Fatalf("bystander received cursor message it should not: %v", msg)
+	default:
+	}
+}
+
+// ─── Debounce ─────────────────────────────────────────────────────────────────
 
 func TestDebouncedBroadcast(t *testing.T) {
 	h := newHub()
@@ -132,6 +262,36 @@ func TestDebouncedBroadcast(t *testing.T) {
 		t.Fatal("debounce timer should have fired and cleared")
 	}
 }
+
+func TestDebounceResetsOnBurst(t *testing.T) {
+	h := newHub()
+	a := mockAdmin("admin-1")
+	h.mu.Lock()
+	h.admins[a.id] = a
+	h.mu.Unlock()
+
+	for i := 0; i < 50; i++ {
+		h.scheduleClientListBroadcast()
+		time.Sleep(time.Millisecond)
+	}
+	time.Sleep(listDebounce + 60*time.Millisecond)
+
+	received := 0
+drain:
+	for {
+		select {
+		case <-a.textSend:
+			received++
+		default:
+			break drain
+		}
+	}
+	if received == 0 {
+		t.Fatal("expected at least one client_list broadcast")
+	}
+}
+
+// ─── Concurrent client info updates ──────────────────────────────────────────
 
 func TestUpdateClientInfoConcurrent(t *testing.T) {
 	h := newHub()
@@ -171,5 +331,41 @@ func TestClientListJSONValid(t *testing.T) {
 	}
 	if msg["type"] != "client_list" {
 		t.Fatalf("type = %v", msg["type"])
+	}
+}
+
+// ─── Frame cleanup on disconnect ──────────────────────────────────────────────
+
+func TestStaleFramesClearedOnClientDisconnect(t *testing.T) {
+	h := newHub()
+	a := mockAdmin("admin-1")
+	h.mu.Lock()
+	h.admins[a.id] = a
+	h.mu.Unlock()
+
+	id := "client-gone"
+	info := ClientInfo{ID: id, ConnectedAt: time.Now()}
+	c := &clientConn{info: info, send: make(chan wsMsg, 4), done: make(chan struct{})}
+	h.registerClient(c)
+	h.addAdminWatch(a, id)
+
+	// Send a frame so the slot is populated.
+	h.routeFrame(id, []byte("frame"))
+
+	a.frameMu.Lock()
+	_, had := a.latestFrames[id]
+	a.frameMu.Unlock()
+	if !had {
+		t.Fatal("frame should be in latestFrames before disconnect")
+	}
+
+	// Client disconnects — stale frames should be purged.
+	h.unregisterClient(id, c)
+
+	a.frameMu.Lock()
+	_, stillHave := a.latestFrames[id]
+	a.frameMu.Unlock()
+	if stillHave {
+		t.Fatal("stale frame should have been removed on client disconnect")
 	}
 }

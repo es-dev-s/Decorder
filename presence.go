@@ -63,9 +63,14 @@ func (ps *presenceStore) load() {
 }
 
 func (ps *presenceStore) save() {
+	// Snapshot events under lock, then release before doing slow disk I/O.
+	// This prevents ingest() and list() from blocking on file writes.
 	ps.mu.Lock()
-	defer ps.mu.Unlock()
-	raw, err := json.MarshalIndent(ps.events, "", "  ")
+	snapshot := make([]PresenceEvent, len(ps.events))
+	copy(snapshot, ps.events)
+	ps.mu.Unlock()
+
+	raw, err := json.MarshalIndent(snapshot, "", "  ")
 	if err != nil {
 		return
 	}

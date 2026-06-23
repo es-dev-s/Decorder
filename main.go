@@ -2,23 +2,34 @@
 //
 // Concurrency design
 // ──────────────────
-// • One write-pump goroutine per WebSocket (serialises all writes, no races).
-// • watchIndex: clientID → set of admins — O(watchers) frame routing, not O(admins).
-// • Every forwarded frame is copied before async handoff (ReadMessage buffer reuse).
-// • Binary frames use drop-oldest backpressure (live video: keep latest).
-// • client_list broadcasts are debounced (100 ms) to avoid storms at scale.
-// • Ping/pong keepalive detects dead peers without blocking the read loop.
+// • One read goroutine + one write goroutine per WebSocket — no shared writes.
+// • watchIndex: clientID → set of admins — O(watchers) frame routing.
+// • Video frames: per-client latest-frame slots on each adminConn.
+//     - One copy per frame total (built once, shared as immutable across all watchers).
+//     - New frame for a client atomically replaces the old one — no queue buildup.
+//     - Write pump drains ALL pending latest frames in one pass, then waits.
+//     - Stale frames are never sent; admin always sees the most recent image.
+// • Text/control: separate reliable channel (client_list, config, policy, cursor).
+//     - Drop-oldest only under genuine queue pressure (independent of video).
+// • Debounced client_list: fires 100 ms after the LAST event in each burst.
+// • cursor/stream_stats routed only to admins watching that specific client.
+// • Graceful shutdown: SIGTERM/SIGINT drains connections before exit.
 
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"log"
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
+	"runtime"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/google/uuid"
@@ -26,28 +37,27 @@ import (
 )
 
 const (
-	writeWait      = 10 * time.Second
-	pongWait       = 60 * time.Second
-	pingPeriod     = (pongWait * 9) / 10
-	maxMessageSize = 10 << 20 // 10 MiB
-	sendQueueDepth = 64       // per-connection outbound buffer
-	listDebounce   = 100 * time.Millisecond
-	// UUID string length prepended to each binary frame sent to admins.
-	adminClientIDLen = 36
+	writeWait        = 10 * time.Second
+	pongWait         = 60 * time.Second
+	pingPeriod       = (pongWait * 9) / 10
+	maxMessageSize   = 10 << 20 // 10 MiB
+	textQueueDepth   = 128      // control/stats messages per admin
+	listDebounce     = 100 * time.Millisecond
+	adminClientIDLen = 36 // UUID string prefix on every binary frame
 )
 
 // ─── Shared types ─────────────────────────────────────────────────────────────
 
 type MonitorInfo struct {
-	Index         uint32 `json:"index"`
-	AdapterIndex  uint32 `json:"adapter_index,omitempty"`
-	OutputIndex   uint32 `json:"output_index,omitempty"`
-	Name          string `json:"name"`
-	Width         uint32 `json:"width"`
-	Height        uint32 `json:"height"`
-	X             int32  `json:"x"`
-	Y             int32  `json:"y"`
-	IsPrimary     bool   `json:"is_primary"`
+	Index        uint32 `json:"index"`
+	AdapterIndex uint32 `json:"adapter_index,omitempty"`
+	OutputIndex  uint32 `json:"output_index,omitempty"`
+	Name         string `json:"name"`
+	Width        uint32 `json:"width"`
+	Height       uint32 `json:"height"`
+	X            int32  `json:"x"`
+	Y            int32  `json:"y"`
+	IsPrimary    bool   `json:"is_primary"`
 }
 
 type ClientInfo struct {
@@ -74,7 +84,7 @@ type wsMsg struct {
 type clientConn struct {
 	info ClientInfo
 	conn *websocket.Conn
-	send chan wsMsg
+	send chan wsMsg // outbound text/control messages from server → client
 	done chan struct{}
 
 	pressureMu       sync.Mutex
@@ -87,7 +97,7 @@ func newClientConn(info ClientInfo, conn *websocket.Conn) *clientConn {
 	c := &clientConn{
 		info: info,
 		conn: conn,
-		send: make(chan wsMsg, sendQueueDepth),
+		send: make(chan wsMsg, 32),
 		done: make(chan struct{}),
 	}
 	go c.writePump()
@@ -106,7 +116,6 @@ func (c *clientConn) writePump() {
 	ticker := time.NewTicker(pingPeriod)
 	defer ticker.Stop()
 	defer c.conn.Close()
-
 	for {
 		select {
 		case <-c.done:
@@ -147,23 +156,43 @@ func (c *clientConn) enqueueText(data []byte) {
 }
 
 // ─── adminConn ────────────────────────────────────────────────────────────────
+//
+// Two outbound paths — completely independent, no head-of-line blocking:
+//
+//   textSend  — reliable drop-oldest FIFO for control/stats/presence text messages.
+//   latestFrames — per-client latest video frame.  A new frame atomically replaces
+//                  the previous one for that client (no queue). framePoke (cap 1)
+//                  wakes the write pump whenever new frames are ready.
+//
+// This means: regardless of how many clients are being watched or how fast they
+// stream, control messages are never delayed by video backlog, and the admin always
+// sees the most recent frame, never a stale one from seconds ago.
 
 type adminConn struct {
 	id         string
 	conn       *websocket.Conn
-	send       chan wsMsg
 	done       chan struct{}
 	watchingMu sync.RWMutex
-	watching   map[string]struct{} // client IDs this admin is viewing
+	watching   map[string]struct{}
+
+	// Reliable outbound channel for text frames (control, stats, presence).
+	textSend chan wsMsg
+
+	// Per-client latest video frame. Shared byte slice (immutable after build).
+	frameMu      sync.Mutex
+	latestFrames map[string][]byte // clientID → pre-built admin frame (uuid+jpeg)
+	framePoke    chan struct{}       // capacity 1; wakes write pump
 }
 
 func newAdminConn(conn *websocket.Conn) *adminConn {
 	a := &adminConn{
-		id:       uuid.New().String(),
-		conn:     conn,
-		send:     make(chan wsMsg, sendQueueDepth),
-		done:     make(chan struct{}),
-		watching: make(map[string]struct{}),
+		id:           uuid.New().String(),
+		conn:         conn,
+		done:         make(chan struct{}),
+		watching:     make(map[string]struct{}),
+		textSend:     make(chan wsMsg, textQueueDepth),
+		latestFrames: make(map[string][]byte),
+		framePoke:    make(chan struct{}, 1),
 	}
 	go a.writePump()
 	return a
@@ -177,6 +206,8 @@ func (a *adminConn) close() {
 	}
 }
 
+// writePump serialises all writes to the admin WebSocket.
+// It handles three independent sources: text messages, video frames, and pings.
 func (a *adminConn) writePump() {
 	ticker := time.NewTicker(pingPeriod)
 	defer ticker.Stop()
@@ -186,7 +217,8 @@ func (a *adminConn) writePump() {
 		select {
 		case <-a.done:
 			return
-		case msg, ok := <-a.send:
+
+		case msg, ok := <-a.textSend:
 			if !ok {
 				return
 			}
@@ -194,6 +226,23 @@ func (a *adminConn) writePump() {
 			if err := a.conn.WriteMessage(msg.mt, msg.data); err != nil {
 				return
 			}
+
+		case <-a.framePoke:
+			// Swap out the entire latestFrames map atomically.
+			// Frames that arrive during this loop land in the new map and will
+			// trigger a new poke — they are never lost.
+			a.frameMu.Lock()
+			batch := a.latestFrames
+			a.latestFrames = make(map[string][]byte, len(batch))
+			a.frameMu.Unlock()
+
+			for _, frame := range batch {
+				_ = a.conn.SetWriteDeadline(time.Now().Add(writeWait))
+				if err := a.conn.WriteMessage(websocket.BinaryMessage, frame); err != nil {
+					return
+				}
+			}
+
 		case <-ticker.C:
 			_ = a.conn.SetWriteDeadline(time.Now().Add(writeWait))
 			if err := a.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
@@ -213,40 +262,35 @@ func (a *adminConn) watchedClients() []string {
 	return out
 }
 
-func buildAdminFrame(clientID string, clientFrame []byte) []byte {
-	out := make([]byte, adminClientIDLen+len(clientFrame))
-	copy(out[:adminClientIDLen], clientID)
-	copy(out[adminClientIDLen:], clientFrame)
-	return out
-}
-
+// enqueueText copies data and sends to the text channel; drops oldest on pressure.
 func (a *adminConn) enqueueText(data []byte) {
 	payload := append([]byte(nil), data...)
 	select {
-	case a.send <- wsMsg{mt: websocket.TextMessage, data: payload}:
+	case a.textSend <- wsMsg{mt: websocket.TextMessage, data: payload}:
 		return
 	default:
 	}
 	select {
-	case <-a.send:
+	case <-a.textSend:
 	default:
 	}
 	select {
-	case a.send <- wsMsg{mt: websocket.TextMessage, data: payload}:
+	case a.textSend <- wsMsg{mt: websocket.TextMessage, data: payload}:
 	default:
 	}
 }
 
-// enqueuePresence delivers attendance events reliably — drops oldest queued message if needed.
+// enqueuePresence delivers attendance/screenshot events reliably.
+// It tries harder than enqueueText before giving up.
 func (a *adminConn) enqueuePresence(data []byte) {
 	payload := append([]byte(nil), data...)
 	for attempt := 0; attempt < 8; attempt++ {
 		select {
-		case a.send <- wsMsg{mt: websocket.TextMessage, data: payload}:
+		case a.textSend <- wsMsg{mt: websocket.TextMessage, data: payload}:
 			return
 		default:
 			select {
-			case <-a.send:
+			case <-a.textSend:
 			default:
 				return
 			}
@@ -254,31 +298,39 @@ func (a *adminConn) enqueuePresence(data []byte) {
 	}
 }
 
-// tryEnqueueBinary copies data and drops oldest frame if queue is full (live stream).
-// Returns true if the frame was queued for delivery.
-func (a *adminConn) tryEnqueueBinary(data []byte) bool {
-	payload := append([]byte(nil), data...)
+// enqueueFrame stores the latest frame for clientID and wakes the write pump.
+// data MUST be an immutable byte slice (caller must not modify it afterwards).
+// Returns true if a previous pending frame was replaced (i.e. the old frame
+// will not be sent — used for backpressure accounting).
+func (a *adminConn) enqueueFrame(clientID string, data []byte) (replaced bool) {
+	a.frameMu.Lock()
+	_, replaced = a.latestFrames[clientID]
+	a.latestFrames[clientID] = data
+	a.frameMu.Unlock()
+
 	select {
-	case a.send <- wsMsg{mt: websocket.BinaryMessage, data: payload}:
-		return true
+	case a.framePoke <- struct{}{}:
 	default:
+		// Write pump is already awake; it will drain the new frame on its next pass.
 	}
-	select {
-	case <-a.send:
-	default:
-	}
-	select {
-	case a.send <- wsMsg{mt: websocket.BinaryMessage, data: payload}:
-		return true
-	default:
-		return false
-	}
+	return replaced
 }
 
-// enqueueBinary copies data and drops oldest frame if queue is full (live stream).
-// Never blocks — safe to call from the client read loop at high frame rates.
-func (a *adminConn) enqueueBinary(data []byte) {
-	_ = a.tryEnqueueBinary(data)
+// removeClientFrames purges all pending frames for clientID when the client
+// disconnects and the admin stops watching it.
+func (a *adminConn) removeClientFrames(clientID string) {
+	a.frameMu.Lock()
+	delete(a.latestFrames, clientID)
+	a.frameMu.Unlock()
+}
+
+// buildAdminFrame prepends the UUID string to the JPEG payload.
+// The resulting slice is immutable and can be shared across multiple adminConns.
+func buildAdminFrame(clientID string, data []byte) []byte {
+	out := make([]byte, adminClientIDLen+len(data))
+	copy(out[:adminClientIDLen], clientID)
+	copy(out[adminClientIDLen:], data)
+	return out
 }
 
 // ─── Hub ──────────────────────────────────────────────────────────────────────
@@ -286,21 +338,21 @@ func (a *adminConn) enqueueBinary(data []byte) {
 type hub struct {
 	mu sync.RWMutex
 
-	clients map[string]*clientConn
-	admins  map[string]*adminConn
+	clients    map[string]*clientConn
+	admins     map[string]*adminConn
+	watchIndex map[string]map[string]*adminConn // clientID → adminID → admin
 
-	// watchIndex[clientID][adminID] = admin — only admins watching that client
-	watchIndex map[string]map[string]*adminConn
+	// Reset-based debounced client_list broadcast.
+	listMu      sync.Mutex
+	listTimer   *time.Timer
+	listVersion uint64
 
-	// Debounced client_list broadcast
-	listMu    sync.Mutex
-	listTimer *time.Timer
-
-	presence *presenceStore
-
+	presence    *presenceStore
 	screenshots *screenshotStore
+	policy      *policyStore
 
-	policy *policyStore
+	activeConns atomic.Int64
+	startTime   time.Time
 }
 
 func newHub() *hub {
@@ -309,6 +361,7 @@ func newHub() *hub {
 		admins:     make(map[string]*adminConn),
 		watchIndex: make(map[string]map[string]*adminConn),
 		presence:   newPresenceStore(),
+		startTime:  time.Now(),
 	}
 	h.screenshots = newScreenshotStore(h.broadcastScreenshot)
 	h.policy = loadPolicyStore()
@@ -317,6 +370,9 @@ func newHub() *hub {
 
 func (h *hub) registerClient(c *clientConn) {
 	h.mu.Lock()
+	if old, ok := h.clients[c.info.ID]; ok && old != c {
+		old.close()
+	}
 	h.clients[c.info.ID] = c
 	h.mu.Unlock()
 	log.Printf("[+] client %-36s  %s@%s  %dx%d@%dfps",
@@ -325,15 +381,21 @@ func (h *hub) registerClient(c *clientConn) {
 	h.scheduleClientListBroadcast()
 }
 
-func (h *hub) unregisterClient(id string) {
+func (h *hub) unregisterClient(id string, c *clientConn) {
 	h.mu.Lock()
+	cur, ok := h.clients[id]
+	if !ok || cur != c {
+		h.mu.Unlock()
+		return
+	}
 	delete(h.clients, id)
-	// Remove from watch index
 	if watchers, ok := h.watchIndex[id]; ok {
 		for adminID, a := range watchers {
 			a.watchingMu.Lock()
 			delete(a.watching, id)
 			a.watchingMu.Unlock()
+			// Remove pending frames for this client so no stale data lingers.
+			a.removeClientFrames(id)
 			delete(watchers, adminID)
 		}
 		delete(h.watchIndex, id)
@@ -378,6 +440,7 @@ func (h *hub) unregisterAdmin(id string) {
 	h.mu.Lock()
 	a, ok := h.admins[id]
 	if ok {
+		a.watchingMu.Lock()
 		for clientID := range a.watching {
 			if m, exists := h.watchIndex[clientID]; exists {
 				delete(m, id)
@@ -386,6 +449,8 @@ func (h *hub) unregisterAdmin(id string) {
 				}
 			}
 		}
+		a.watching = make(map[string]struct{})
+		a.watchingMu.Unlock()
 		delete(h.admins, id)
 	}
 	h.mu.Unlock()
@@ -422,6 +487,7 @@ func (h *hub) removeAdminWatch(a *adminConn, clientID string) {
 	a.watchingMu.Lock()
 	delete(a.watching, clientID)
 	a.watchingMu.Unlock()
+	a.removeClientFrames(clientID)
 
 	if m, ok := h.watchIndex[clientID]; ok {
 		delete(m, a.id)
@@ -443,13 +509,17 @@ func (h *hub) clearAdminWatch(a *adminConn) {
 				delete(h.watchIndex, clientID)
 			}
 		}
+		a.removeClientFrames(clientID)
 	}
 	a.watching = make(map[string]struct{})
 	a.watchingMu.Unlock()
 }
 
-// routeFrame forwards a frame to all admins watching clientID.
-// CRITICAL: copies data — gorilla ReadMessage reuses the read buffer.
+// routeFrame delivers a JPEG frame from clientID to every watching admin.
+//
+// One copy total: buildAdminFrame creates the framed payload once.
+// The same immutable slice is handed to every admin's enqueueFrame — no
+// additional copies. Each admin's write pump reads it and sends it over the wire.
 func (h *hub) routeFrame(clientID string, data []byte) {
 	h.mu.RLock()
 	watchers := h.watchIndex[clientID]
@@ -464,18 +534,22 @@ func (h *hub) routeFrame(clientID string, data []byte) {
 	}
 	h.mu.RUnlock()
 
+	// Build once, share across all watchers.
 	frame := buildAdminFrame(clientID, data)
-	delivered := 0
-	dropped := 0
+
+	replaced := 0
+	sent := 0
 	for _, a := range targets {
-		if a.tryEnqueueBinary(frame) {
-			delivered++
+		if a.enqueueFrame(clientID, frame) {
+			replaced++
 		} else {
-			dropped++
+			sent++
 		}
 	}
-	if client != nil && (delivered > 0 || dropped > 0) {
-		client.noteRoutePressure(uint64(delivered), uint64(dropped))
+	// Signal backpressure to the client when a significant fraction of frames
+	// are being replaced before delivery (admin is too slow to consume them).
+	if client != nil && (sent+replaced) > 0 {
+		client.noteRoutePressure(uint64(sent), uint64(replaced))
 	}
 }
 
@@ -508,6 +582,7 @@ func (c *clientConn) noteRoutePressure(delivered, dropped uint64) {
 	c.enqueueText(msg)
 }
 
+// broadcastToAdmins sends to ALL connected admins (client_list, policy, etc.).
 func (h *hub) broadcastToAdmins(data []byte) {
 	h.mu.RLock()
 	admins := make([]*adminConn, 0, len(h.admins))
@@ -516,6 +591,25 @@ func (h *hub) broadcastToAdmins(data []byte) {
 	}
 	h.mu.RUnlock()
 	for _, a := range admins {
+		a.enqueueText(data)
+	}
+}
+
+// broadcastToWatchers sends only to admins watching clientID (cursor, stats).
+// At 100 clients × 30fps this avoids O(admins × clients) unnecessary sends.
+func (h *hub) broadcastToWatchers(clientID string, data []byte) {
+	h.mu.RLock()
+	watchers := h.watchIndex[clientID]
+	if len(watchers) == 0 {
+		h.mu.RUnlock()
+		return
+	}
+	targets := make([]*adminConn, 0, len(watchers))
+	for _, a := range watchers {
+		targets = append(targets, a)
+	}
+	h.mu.RUnlock()
+	for _, a := range targets {
 		a.enqueueText(data)
 	}
 }
@@ -577,18 +671,7 @@ func (h *hub) updateClientStatus(clientID string, monitorIndex, width, height ui
 		if height > 0 {
 			c.info.Height = height
 		}
-		m := map[string]any{
-			"type":          "config",
-			"client_id":     clientID,
-			"width":         c.info.Width,
-			"height":        c.info.Height,
-			"fps":           c.info.FPS,
-			"quality":       c.info.Quality,
-			"monitor_index": c.info.MonitorIndex,
-			"monitors":      c.info.Monitors,
-			"codec":         "mjpeg",
-		}
-		cfgMsg, _ = json.Marshal(m)
+		cfgMsg = h.buildConfigMsgLocked(clientID, c)
 	}
 	if m, ok := h.watchIndex[clientID]; ok {
 		watching = make([]*adminConn, 0, len(m))
@@ -651,18 +734,7 @@ func (h *hub) updateClientMonitors(clientID string, monitors []MonitorInfo, moni
 				c.info.Height = mon.Height
 			}
 		}
-		m := map[string]any{
-			"type":          "config",
-			"client_id":     clientID,
-			"width":         c.info.Width,
-			"height":        c.info.Height,
-			"fps":           c.info.FPS,
-			"quality":       c.info.Quality,
-			"monitor_index": c.info.MonitorIndex,
-			"monitors":      c.info.Monitors,
-			"codec":         "mjpeg",
-		}
-		cfgMsg, _ = json.Marshal(m)
+		cfgMsg = h.buildConfigMsgLocked(clientID, c)
 	}
 	if m, ok := h.watchIndex[clientID]; ok {
 		watching = make([]*adminConn, 0, len(m))
@@ -681,51 +753,8 @@ func (h *hub) updateClientMonitors(clientID string, monitors []MonitorInfo, moni
 	}
 }
 
-func (h *hub) buildClientListJSONLocked() []byte {
-	list := make([]ClientInfo, 0, len(h.clients))
-	for _, c := range h.clients {
-		list = append(list, c.info)
-	}
-	msg := map[string]any{"type": "client_list", "clients": list}
-	data, _ := json.Marshal(msg)
-	return data
-}
-
-func (h *hub) scheduleClientListBroadcast() {
-	h.listMu.Lock()
-	defer h.listMu.Unlock()
-	if h.listTimer != nil {
-		return
-	}
-	h.listTimer = time.AfterFunc(listDebounce, func() {
-		h.listMu.Lock()
-		h.listTimer = nil
-		h.listMu.Unlock()
-		h.broadcastClientListNow()
-	})
-}
-
-func (h *hub) broadcastClientListNow() {
-	h.mu.RLock()
-	msg := h.buildClientListJSONLocked()
-	admins := make([]*adminConn, 0, len(h.admins))
-	for _, a := range h.admins {
-		admins = append(admins, a)
-	}
-	h.mu.RUnlock()
-
-	for _, a := range admins {
-		a.enqueueText(msg)
-	}
-}
-
-func (h *hub) clientConfigJSON(clientID string) []byte {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-	c, ok := h.clients[clientID]
-	if !ok {
-		return nil
-	}
+// buildConfigMsgLocked builds a "config" JSON message. Must be called with h.mu held.
+func (h *hub) buildConfigMsgLocked(clientID string, c *clientConn) []byte {
 	m := map[string]any{
 		"type":          "config",
 		"client_id":     clientID,
@@ -741,13 +770,68 @@ func (h *hub) clientConfigJSON(clientID string) []byte {
 	return data
 }
 
-// ─── WebSocket upgrader ─────────────────────────────────────────────────────
+func (h *hub) buildClientListJSONLocked() []byte {
+	list := make([]ClientInfo, 0, len(h.clients))
+	for _, c := range h.clients {
+		list = append(list, c.info)
+	}
+	msg := map[string]any{"type": "client_list", "clients": list}
+	data, _ := json.Marshal(msg)
+	return data
+}
+
+// scheduleClientListBroadcast collapses bursts of register/unregister events
+// into a single broadcast fired 100 ms after the LAST event.
+func (h *hub) scheduleClientListBroadcast() {
+	h.listMu.Lock()
+	h.listVersion++
+	ver := h.listVersion
+	if h.listTimer != nil {
+		h.listTimer.Stop()
+	}
+	h.listTimer = time.AfterFunc(listDebounce, func() {
+		h.listMu.Lock()
+		if h.listVersion != ver {
+			h.listMu.Unlock()
+			return
+		}
+		h.listTimer = nil
+		h.listMu.Unlock()
+		h.broadcastClientListNow()
+	})
+	h.listMu.Unlock()
+}
+
+func (h *hub) broadcastClientListNow() {
+	h.mu.RLock()
+	msg := h.buildClientListJSONLocked()
+	admins := make([]*adminConn, 0, len(h.admins))
+	for _, a := range h.admins {
+		admins = append(admins, a)
+	}
+	h.mu.RUnlock()
+	for _, a := range admins {
+		a.enqueueText(msg)
+	}
+}
+
+func (h *hub) clientConfigJSON(clientID string) []byte {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	c, ok := h.clients[clientID]
+	if !ok {
+		return nil
+	}
+	return h.buildConfigMsgLocked(clientID, c)
+}
+
+// ─── WebSocket upgrader ──────────────────────────────────────────────────────
 
 var upgrader = websocket.Upgrader{
-	CheckOrigin:     func(*http.Request) bool { return true },
-	ReadBufferSize:  4096,
-	WriteBufferSize: 256 * 1024,
-	EnableCompression: false, // compression adds CPU latency for JPEG streams
+	CheckOrigin:       func(*http.Request) bool { return true },
+	ReadBufferSize:    4096,
+	WriteBufferSize:   256 * 1024,
+	EnableCompression: false,
 }
 
 func configureConn(conn *websocket.Conn) {
@@ -758,7 +842,7 @@ func configureConn(conn *websocket.Conn) {
 	})
 }
 
-// ─── Client handler ───────────────────────────────────────────────────────────
+// ─── Client handler ──────────────────────────────────────────────────────────
 
 func (h *hub) handleClientWS(w http.ResponseWriter, r *http.Request) {
 	conn, err := upgrader.Upgrade(w, r, nil)
@@ -767,7 +851,10 @@ func (h *hub) handleClientWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	configureConn(conn)
+	h.activeConns.Add(1)
+	defer h.activeConns.Add(-1)
 
+	_ = conn.SetReadDeadline(time.Now().Add(pongWait))
 	_, raw, err := conn.ReadMessage()
 	if err != nil {
 		conn.Close()
@@ -820,7 +907,7 @@ func (h *hub) handleClientWS(w http.ResponseWriter, r *http.Request) {
 	h.pushPolicyToClient(c)
 	defer func() {
 		c.close()
-		h.unregisterClient(info.ID)
+		h.unregisterClient(info.ID, c)
 	}()
 
 	for {
@@ -832,34 +919,42 @@ func (h *hub) handleClientWS(w http.ResponseWriter, r *http.Request) {
 		switch mt {
 		case websocket.BinaryMessage:
 			h.routeFrame(info.ID, data)
+
 		case websocket.TextMessage:
 			var msg map[string]any
 			if err := json.Unmarshal(data, &msg); err != nil {
 				continue
 			}
-			if msg["type"] == "status" {
+			switch msg["type"] {
+			case "status":
 				idxF, _ := msg["monitor_index"].(float64)
 				wF, _ := msg["width"].(float64)
 				hF, _ := msg["height"].(float64)
 				h.updateClientStatus(info.ID, uint32(idxF), uint32(wF), uint32(hF))
-			} else if msg["type"] == "monitors" {
+
+			case "monitors":
 				idxF, _ := msg["monitor_index"].(float64)
 				if rawMons, ok := msg["monitors"].([]any); ok {
 					mons := parseMonitorsJSON(rawMons)
 					h.updateClientMonitors(info.ID, mons, uint32(idxF))
 				}
-			} else if msg["type"] == "stream_stats" || msg["type"] == "cursor" {
+
+			case "stream_stats", "cursor":
+				// Route only to admins watching this client.
 				msg["client_id"] = info.ID
 				if raw, err := json.Marshal(msg); err == nil {
-					h.broadcastToAdmins(raw)
+					h.broadcastToWatchers(info.ID, raw)
 				}
-				if fpsF, ok := msg["fps_target"].(float64); ok && fpsF > 0 {
-					h.updateClientInfo(info.ID, uint32(fpsF), 0, 0)
+				if t, _ := msg["type"].(string); t == "stream_stats" {
+					if fpsF, ok := msg["fps_target"].(float64); ok && fpsF > 0 {
+						h.updateClientInfo(info.ID, uint32(fpsF), 0, 0)
+					}
+					if qF, ok := msg["quality"].(float64); ok && qF > 0 {
+						h.updateClientInfo(info.ID, 0, uint32(qF), 0)
+					}
 				}
-				if qF, ok := msg["quality"].(float64); ok && qF > 0 {
-					h.updateClientInfo(info.ID, 0, uint32(qF), 0)
-				}
-			} else if msg["type"] == "presence_sync" {
+
+			case "presence_sync":
 				h.handlePresenceSync(info.ID, msg)
 			}
 		}
@@ -875,6 +970,8 @@ func (h *hub) handleAdminWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	configureConn(conn)
+	h.activeConns.Add(1)
+	defer h.activeConns.Add(-1)
 
 	a := newAdminConn(conn)
 	h.registerAdmin(a)
@@ -983,9 +1080,13 @@ func (h *hub) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	h.mu.RUnlock()
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"status":  "ok",
-		"clients": nClients,
-		"admins":  nAdmins,
+		"status":       "ok",
+		"clients":      nClients,
+		"admins":       nAdmins,
+		"goroutines":   runtime.NumGoroutine(),
+		"active_conns": h.activeConns.Load(),
+		"uptime_sec":   int(time.Since(h.startTime).Seconds()),
+		"go_version":   runtime.Version(),
 	})
 }
 
@@ -998,8 +1099,10 @@ func main() {
 	if portDefault == "" {
 		portDefault = defaultPort
 	}
-	port := flag.String("port", portDefault, "TCP port (default from DECODER_PORT env or 8090)")
+	port := flag.String("port", portDefault, "TCP port (env: DECODER_PORT, default 8090)")
 	flag.Parse()
+
+	log.Printf("Decoder relay  GOMAXPROCS=%d  Go=%s", runtime.GOMAXPROCS(0), runtime.Version())
 
 	h := newHub()
 
@@ -1017,24 +1120,39 @@ func main() {
 		Addr:              ":" + *port,
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       0, // WebSocket connections are long-lived
+		ReadTimeout:       0,
 		WriteTimeout:      0,
 		IdleTimeout:       120 * time.Second,
 		MaxHeaderBytes:    1 << 20,
 	}
 
-	addr := srv.Addr
-	ln, err := net.Listen("tcp", addr)
+	ln, err := net.Listen("tcp", srv.Addr)
 	if err != nil {
-		log.Fatalf("listen tcp %s: %v", addr, err)
+		log.Fatalf("listen %s: %v", srv.Addr, err)
 	}
 
-	log.Printf("Decoder relay server  listening on %s", addr)
-	log.Printf("  Client stream:  ws://0.0.0.0%s/ws/client", addr)
-	log.Printf("  Admin viewer:   ws://0.0.0.0%s/ws/admin", addr)
-	log.Printf("  Client list:    http://0.0.0.0%s/api/clients", addr)
-	log.Printf("  Presence log:   http://0.0.0.0%s/api/presence", addr)
-	log.Printf("  Screenshots:    http://0.0.0.0%s/api/screenshots", addr)
-	log.Printf("  Health:         http://0.0.0.0%s/health", addr)
-	log.Fatal(srv.Serve(ln))
+	log.Printf("  Client WS:   ws://0.0.0.0%s/ws/client", srv.Addr)
+	log.Printf("  Admin WS:    ws://0.0.0.0%s/ws/admin", srv.Addr)
+	log.Printf("  Clients API: http://0.0.0.0%s/api/clients", srv.Addr)
+	log.Printf("  Health:      http://0.0.0.0%s/health", srv.Addr)
+
+	done := make(chan struct{})
+	go func() {
+		quit := make(chan os.Signal, 1)
+		signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+		sig := <-quit
+		log.Printf("Signal %s — shutting down (15 s drain)", sig)
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(ctx); err != nil {
+			log.Printf("Shutdown: %v", err)
+		}
+		close(done)
+	}()
+
+	if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
+		log.Fatalf("serve: %v", err)
+	}
+	<-done
+	log.Println("Server stopped cleanly.")
 }
