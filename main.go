@@ -61,17 +61,18 @@ type MonitorInfo struct {
 }
 
 type ClientInfo struct {
-	ID           string        `json:"id"`
-	Hostname     string        `json:"hostname"`
-	Username     string        `json:"username"`
-	OS           string        `json:"os"`
-	Width        uint32        `json:"width"`
-	Height       uint32        `json:"height"`
-	FPS          uint32        `json:"fps"`
-	Quality      uint32        `json:"quality"`
-	MonitorIndex uint32        `json:"monitor_index"`
-	Monitors     []MonitorInfo `json:"monitors"`
-	ConnectedAt  time.Time     `json:"connected_at"`
+	ID            string        `json:"id"`
+	Hostname      string        `json:"hostname"`
+	Username      string        `json:"username"`
+	OS            string        `json:"os"`
+	Width         uint32        `json:"width"`
+	Height        uint32        `json:"height"`
+	FPS           uint32        `json:"fps"`
+	Quality       uint32        `json:"quality"`
+	MonitorIndex  uint32        `json:"monitor_index"`
+	Monitors      []MonitorInfo `json:"monitors"`
+	ConnectedAt   time.Time     `json:"connected_at"`
+	SessionLocked *bool         `json:"session_locked,omitempty"`
 }
 
 type wsMsg struct {
@@ -658,6 +659,29 @@ func (h *hub) updateClientInfo(clientID string, fps, quality, monitorIndex uint3
 	h.scheduleClientListBroadcast()
 }
 
+func (h *hub) updateClientSessionLocked(clientID string, locked bool) {
+	var changed bool
+	h.mu.Lock()
+	if c, ok := h.clients[clientID]; ok {
+		if c.info.SessionLocked == nil || *c.info.SessionLocked != locked {
+			v := locked
+			c.info.SessionLocked = &v
+			changed = true
+		}
+	}
+	h.mu.Unlock()
+	if !changed {
+		return
+	}
+	payload, _ := json.Marshal(map[string]any{
+		"type":           "session_state",
+		"client_id":      clientID,
+		"session_locked": locked,
+	})
+	h.broadcastToAdmins(payload)
+	h.scheduleClientListBroadcast()
+}
+
 func (h *hub) updateClientStatus(clientID string, monitorIndex, width, height uint32) {
 	var cfgMsg []byte
 	var watching []*adminConn
@@ -862,16 +886,17 @@ func (h *hub) handleClientWS(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var hello struct {
-		ID           string        `json:"id"`
-		Hostname     string        `json:"hostname"`
-		Username     string        `json:"username"`
-		OS           string        `json:"os"`
-		Width        uint32        `json:"width"`
-		Height       uint32        `json:"height"`
-		FPS          uint32        `json:"fps"`
-		Quality      uint32        `json:"quality"`
-		MonitorIndex uint32        `json:"monitor_index"`
-		Monitors     []MonitorInfo `json:"monitors"`
+		ID            string        `json:"id"`
+		Hostname      string        `json:"hostname"`
+		Username      string        `json:"username"`
+		OS            string        `json:"os"`
+		Width         uint32        `json:"width"`
+		Height        uint32        `json:"height"`
+		FPS           uint32        `json:"fps"`
+		Quality       uint32        `json:"quality"`
+		MonitorIndex  uint32        `json:"monitor_index"`
+		Monitors      []MonitorInfo `json:"monitors"`
+		SessionLocked *bool         `json:"session_locked"`
 	}
 	if err := json.Unmarshal(raw, &hello); err != nil {
 		log.Printf("invalid client hello: %v", err)
@@ -883,17 +908,18 @@ func (h *hub) handleClientWS(w http.ResponseWriter, r *http.Request) {
 	}
 
 	info := ClientInfo{
-		ID:           hello.ID,
-		Hostname:     hello.Hostname,
-		Username:     hello.Username,
-		OS:           hello.OS,
-		Width:        hello.Width,
-		Height:       hello.Height,
-		FPS:          hello.FPS,
-		Quality:      hello.Quality,
-		MonitorIndex: hello.MonitorIndex,
-		Monitors:     hello.Monitors,
-		ConnectedAt:  time.Now(),
+		ID:            hello.ID,
+		Hostname:      hello.Hostname,
+		Username:      hello.Username,
+		OS:            hello.OS,
+		Width:         hello.Width,
+		Height:        hello.Height,
+		FPS:           hello.FPS,
+		Quality:       hello.Quality,
+		MonitorIndex:  hello.MonitorIndex,
+		Monitors:      hello.Monitors,
+		ConnectedAt:   time.Now(),
+		SessionLocked: hello.SessionLocked,
 	}
 	if info.Quality == 0 {
 		info.Quality = 85
@@ -956,6 +982,10 @@ func (h *hub) handleClientWS(w http.ResponseWriter, r *http.Request) {
 
 			case "presence_sync":
 				h.handlePresenceSync(info.ID, msg)
+
+			case "session_state":
+				locked, _ := msg["session_locked"].(bool)
+				h.updateClientSessionLocked(info.ID, locked)
 			}
 		}
 	}
