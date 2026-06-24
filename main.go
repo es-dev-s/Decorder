@@ -1301,6 +1301,7 @@ func main() {
 	mux.HandleFunc("/health", h.handleHealth)
 
 	tlsCfg := BuildTLSConfig()
+	useTLS := tlsCfg != nil
 
 	srv := &http.Server{
 		Addr:              ":" + *port,
@@ -1318,10 +1319,17 @@ func main() {
 		log.Fatalf("listen %s: %v", srv.Addr, err)
 	}
 
-	log.Printf("  Client WS:   wss://0.0.0.0%s/ws/client", srv.Addr)
-	log.Printf("  Admin WS:    wss://0.0.0.0%s/ws/admin", srv.Addr)
-	log.Printf("  Clients API: https://0.0.0.0%s/api/clients", srv.Addr)
-	log.Printf("  Health:      https://0.0.0.0%s/health", srv.Addr)
+	if useTLS {
+		log.Printf("  Mode:        TLS (Go handles TLS — Railway must use TCP passthrough)")
+		log.Printf("  Client WS:   wss://0.0.0.0%s/ws/client", srv.Addr)
+		log.Printf("  Admin WS:    wss://0.0.0.0%s/ws/admin", srv.Addr)
+	} else {
+		log.Printf("  Mode:        plain HTTP (Railway/Cloudflare proxy handles TLS)")
+		log.Printf("  Client WS:   ws://0.0.0.0%s/ws/client  (proxied as wss://)", srv.Addr)
+		log.Printf("  Admin WS:    ws://0.0.0.0%s/ws/admin   (proxied as wss://)", srv.Addr)
+		log.Printf("  NOTE: run certs/init-ca.sh to enable Go-native mTLS")
+	}
+	log.Printf("  Health:      http://0.0.0.0%s/health", srv.Addr)
 
 	done := make(chan struct{})
 	go func() {
@@ -1337,8 +1345,16 @@ func main() {
 		close(done)
 	}()
 
-	if err := srv.ServeTLS(ln, certPath("DECODER_SERVER_CERT", "certs/server.pem"), certPath("DECODER_SERVER_KEY", "certs/server-key.pem")); err != nil && err != http.ErrServerClosed {
-		log.Fatalf("serve: %v", err)
+	var serveErr error
+	if useTLS {
+		serveErr = srv.ServeTLS(ln,
+			certPath("DECODER_SERVER_CERT", "certs/server.pem"),
+			certPath("DECODER_SERVER_KEY", "certs/server-key.pem"))
+	} else {
+		serveErr = srv.Serve(ln)
+	}
+	if serveErr != nil && serveErr != http.ErrServerClosed {
+		log.Fatalf("serve: %v", serveErr)
 	}
 	<-done
 	log.Println("Server stopped cleanly.")

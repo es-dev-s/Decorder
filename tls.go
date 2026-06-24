@@ -35,7 +35,23 @@ func certPath(envKey, defaultVal string) string {
 	return defaultVal
 }
 
+// CertsReady returns true when the server cert and key files both exist.
+// When false, the server falls back to plain HTTP (Railway/Cloudflare proxy handles TLS).
+func CertsReady() bool {
+	cert := certPath("DECODER_SERVER_CERT", "certs/server.pem")
+	key  := certPath("DECODER_SERVER_KEY",  "certs/server-key.pem")
+	_, errC := os.Stat(cert)
+	_, errK := os.Stat(key)
+	return errC == nil && errK == nil
+}
+
+// BuildTLSConfig returns nil if cert files are not present (pre-CA-setup mode).
+// Callers must check for nil and fall back to plain http.Serve().
 func BuildTLSConfig() *tls.Config {
+	if !CertsReady() {
+		return nil
+	}
+
 	caPath     := certPath("DECODER_CA_CERT", "certs/intermediate-ca.pem")
 	serverCert := certPath("DECODER_SERVER_CERT", "certs/server.pem")
 	serverKey  := certPath("DECODER_SERVER_KEY", "certs/server-key.pem")
