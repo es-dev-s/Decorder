@@ -21,6 +21,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"strings"
 	"flag"
 	"log"
 	"net"
@@ -868,8 +869,20 @@ var clientUpgrader = websocket.Upgrader{
 var adminUpgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool {
 		o := r.Header.Get("Origin")
-		// Allow Tauri local origins only; reject browser origins.
-		return o == "tauri://localhost" || o == "https://tauri.localhost" || o == ""
+		if o == "" {
+			return true // same-origin or non-browser client
+		}
+		// Production Tauri app — both WebView2 and WKWebView origins.
+		if o == "tauri://localhost" || o == "https://tauri.localhost" {
+			return true
+		}
+		// Tauri dev mode: Vite dev server on localhost (any port).
+		// Identity is enforced by mTLS when certs are present; origin
+		// is a secondary hint, not the primary auth mechanism.
+		if strings.HasPrefix(o, "http://localhost:") || strings.HasPrefix(o, "https://localhost:") {
+			return true
+		}
+		return false
 	},
 	ReadBufferSize:    4096,
 	WriteBufferSize:   256 * 1024,
