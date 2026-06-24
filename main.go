@@ -19,6 +19,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"flag"
 	"log"
@@ -92,6 +93,10 @@ type clientConn struct {
 	pressureRouted   uint64
 	pressureDropped  uint64
 	lastPressureSent time.Time
+
+	// Phase 2.2: per-session replay guard.
+	replayMu sync.Mutex
+	replay   *ReplayGuard
 }
 
 func newClientConn(info ClientInfo, conn *websocket.Conn) *clientConn {
@@ -851,12 +856,28 @@ func (h *hub) clientConfigJSON(clientID string) []byte {
 
 // ─── WebSocket upgrader ──────────────────────────────────────────────────────
 
-var upgrader = websocket.Upgrader{
+// upgrader is split: clients use clientUpgrader (any origin, pre-mTLS).
+// Admins use adminUpgrader (strict Tauri origin check).
+var clientUpgrader = websocket.Upgrader{
 	CheckOrigin:       func(*http.Request) bool { return true },
 	ReadBufferSize:    4096,
 	WriteBufferSize:   256 * 1024,
 	EnableCompression: false,
 }
+
+var adminUpgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool {
+		o := r.Header.Get("Origin")
+		// Allow Tauri local origins only; reject browser origins.
+		return o == "tauri://localhost" || o == "https://tauri.localhost" || o == ""
+	},
+	ReadBufferSize:    4096,
+	WriteBufferSize:   256 * 1024,
+	EnableCompression: false,
+}
+
+// upgrader retained for non-WS handlers; use clientUpgrader/adminUpgrader for WS.
+var upgrader = clientUpgrader
 
 func configureConn(conn *websocket.Conn) {
 	conn.SetReadLimit(maxMessageSize)
@@ -869,7 +890,10 @@ func configureConn(conn *websocket.Conn) {
 // ─── Client handler ──────────────────────────────────────────────────────────
 
 func (h *hub) handleClientWS(w http.ResponseWriter, r *http.Request) {
-	conn, err := upgrader.Upgrade(w, r, nil)
+	// Phase 1.5: when mTLS is enabled, verify the client cert CN matches the
+	// device ID sent in the hello message.  The check uses the pre-registered
+	// device ID — we defer to post-hello validation inside the loop.
+	conn, err := clientUpgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Printf("client upgrade: %v", err)
 		return
@@ -907,6 +931,23 @@ func (h *hub) handleClientWS(w http.ResponseWriter, r *http.Request) {
 		hello.ID = uuid.New().String()
 	}
 
+	// mTLS identity check: when enabled, the cert CN must match the claimed ID.
+	if clientAuth == tls.RequireAndVerifyClientCert {
+		if err := VerifyDeviceIdentity(r, hello.ID); err != nil {
+			log.Printf("[auth] device identity mismatch: %v", err)
+			Audit(AuditEvent{
+				EventType:  "client_connect",
+				DeviceID:   hello.ID,
+				RemoteAddr: r.RemoteAddr,
+				CertCN:     PeerCertCN(r),
+				Outcome:    "deny",
+				Reason:     err.Error(),
+			})
+			conn.Close()
+			return
+		}
+	}
+
 	info := ClientInfo{
 		ID:            hello.ID,
 		Hostname:      hello.Hostname,
@@ -931,9 +972,22 @@ func (h *hub) handleClientWS(w http.ResponseWriter, r *http.Request) {
 	c := newClientConn(info, conn)
 	h.registerClient(c)
 	h.pushPolicyToClient(c)
+	Audit(AuditEvent{
+		EventType:  "client_connect",
+		DeviceID:   info.ID,
+		RemoteAddr: r.RemoteAddr,
+		CertCN:     PeerCertCN(r),
+		Outcome:    "allow",
+	})
 	defer func() {
 		c.close()
 		h.unregisterClient(info.ID, c)
+		Audit(AuditEvent{
+			EventType: "client_disconnect",
+			DeviceID:  info.ID,
+			CertCN:    PeerCertCN(r),
+			Outcome:   "allow",
+		})
 	}()
 
 	for {
@@ -944,6 +998,21 @@ func (h *hub) handleClientWS(w http.ResponseWriter, r *http.Request) {
 		}
 		switch mt {
 		case websocket.BinaryMessage:
+			// Read version byte (byte 0) for replay guard (Phase 2.2).
+			// Version 0x01 = plain, 0x02 = AES-GCM encrypted.
+			// The server relays the entire message as-is — it never decrypts.
+			if err := h.checkReplay(info.ID, data); err != nil {
+				log.Printf("[replay] %s: %v — dropping frame", info.ID, err)
+				Audit(AuditEvent{
+					EventType: "client_replay_detected",
+					DeviceID:  info.ID,
+					RemoteAddr: r.RemoteAddr,
+					CertCN:    PeerCertCN(r),
+					Outcome:   "deny",
+					Reason:    err.Error(),
+				})
+				continue
+			}
 			h.routeFrame(info.ID, data)
 
 		case websocket.TextMessage:
@@ -994,7 +1063,16 @@ func (h *hub) handleClientWS(w http.ResponseWriter, r *http.Request) {
 // ─── Admin handler ────────────────────────────────────────────────────────────
 
 func (h *hub) handleAdminWS(w http.ResponseWriter, r *http.Request) {
-	conn, err := upgrader.Upgrade(w, r, nil)
+	// Phase 1.5: when mTLS is enabled, verify admin cert identity.
+	if clientAuth == tls.RequireAndVerifyClientCert {
+		if err := VerifyAdminIdentity(r); err != nil {
+			log.Printf("[auth] admin identity check failed: %v", err)
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+	}
+
+	conn, err := adminUpgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Printf("admin upgrade: %v", err)
 		return
@@ -1003,10 +1081,65 @@ func (h *hub) handleAdminWS(w http.ResponseWriter, r *http.Request) {
 	h.activeConns.Add(1)
 	defer h.activeConns.Add(-1)
 
+	// Phase 2.3: expect first message {"type":"auth","token":"<paseto>"} within 5 s.
+	// If DECODER_PASETO_KEY is set (production), token is mandatory.
+	// If not set (local dev), token check is skipped.
+	if os.Getenv("DECODER_PASETO_KEY") != "" {
+		_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		_, authRaw, err := conn.ReadMessage()
+		if err != nil {
+			conn.Close()
+			return
+		}
+		var authMsg map[string]string
+		if err := json.Unmarshal(authRaw, &authMsg); err != nil || authMsg["type"] != "auth" || authMsg["token"] == "" {
+			_ = conn.WriteMessage(websocket.CloseMessage,
+				websocket.FormatCloseMessage(4001, "auth required"))
+			conn.Close()
+			Audit(AuditEvent{
+				EventType:  "admin_connect_denied",
+				RemoteAddr: r.RemoteAddr,
+				CertCN:     PeerCertCN(r),
+				Outcome:    "deny",
+				Reason:     "missing or malformed auth message",
+			})
+			return
+		}
+		token, err := VerifyAdminToken(authMsg["token"])
+		if err != nil {
+			_ = conn.WriteMessage(websocket.CloseMessage,
+				websocket.FormatCloseMessage(4001, "token invalid"))
+			conn.Close()
+			Audit(AuditEvent{
+				EventType:  "admin_connect_denied",
+				RemoteAddr: r.RemoteAddr,
+				CertCN:     PeerCertCN(r),
+				Outcome:    "deny",
+				Reason:     err.Error(),
+			})
+			return
+		}
+		adminID, _ := token.GetString("sub")
+		log.Printf("[auth] admin authenticated: %s (cert: %s)", adminID, PeerCertCN(r))
+	}
+
 	a := newAdminConn(conn)
 	h.registerAdmin(a)
+	Audit(AuditEvent{
+		EventType:  "admin_connect",
+		AdminID:    a.id,
+		RemoteAddr: r.RemoteAddr,
+		CertCN:     PeerCertCN(r),
+		Outcome:    "allow",
+	})
 	defer func() {
 		h.unregisterAdmin(a.id)
+		Audit(AuditEvent{
+			EventType: "admin_disconnect",
+			AdminID:   a.id,
+			CertCN:    PeerCertCN(r),
+			Outcome:   "allow",
+		})
 	}()
 
 	for {
@@ -1134,11 +1267,32 @@ func main() {
 
 	log.Printf("Decoder relay  GOMAXPROCS=%d  Go=%s", runtime.GOMAXPROCS(0), runtime.Version())
 
+	// Start audit log.
+	auditPath := os.Getenv("DECODER_AUDIT_LOG")
+	if auditPath == "" {
+		auditPath = "audit.jsonl"
+	}
+	initAuditLog(auditPath)
+
+	// Start CRL store (no-op if crl.pem does not exist yet).
+	crlPath := certPath("DECODER_CRL_PATH", "certs/crl.pem")
+	initCRLStore(crlPath)
+
+	// Initialise PASETO key (panics if DECODER_PASETO_KEY is set but invalid).
+	if os.Getenv("DECODER_PASETO_KEY") != "" {
+		initPasetoKey()
+	} else {
+		log.Println("[auth] DECODER_PASETO_KEY not set — token auth disabled (dev mode)")
+	}
+
 	h := newHub()
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/ws/client", h.handleClientWS)
+	mux.Handle("/ws/client", RateLimitMiddleware(http.HandlerFunc(h.handleClientWS)))
 	mux.HandleFunc("/ws/admin", h.handleAdminWS)
+	h.registerEnrolRoute(mux)
+	mux.HandleFunc("/auth/login", h.handleAuthLogin)
+	mux.HandleFunc("/auth/refresh", h.handleAuthRefresh)
 	mux.HandleFunc("/api/clients", h.handleAPIClients)
 	mux.HandleFunc("/api/presence", h.handleAPIPresence)
 	mux.HandleFunc("/api/screenshots/upload", h.handleScreenshotUpload)
@@ -1146,9 +1300,12 @@ func main() {
 	mux.HandleFunc("/api/screenshots", h.handleAPIScreenshots)
 	mux.HandleFunc("/health", h.handleHealth)
 
+	tlsCfg := BuildTLSConfig()
+
 	srv := &http.Server{
 		Addr:              ":" + *port,
-		Handler:           mux,
+		Handler:           SecurityHeaders(mux),
+		TLSConfig:         tlsCfg,
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       0,
 		WriteTimeout:      0,
@@ -1161,10 +1318,10 @@ func main() {
 		log.Fatalf("listen %s: %v", srv.Addr, err)
 	}
 
-	log.Printf("  Client WS:   ws://0.0.0.0%s/ws/client", srv.Addr)
-	log.Printf("  Admin WS:    ws://0.0.0.0%s/ws/admin", srv.Addr)
-	log.Printf("  Clients API: http://0.0.0.0%s/api/clients", srv.Addr)
-	log.Printf("  Health:      http://0.0.0.0%s/health", srv.Addr)
+	log.Printf("  Client WS:   wss://0.0.0.0%s/ws/client", srv.Addr)
+	log.Printf("  Admin WS:    wss://0.0.0.0%s/ws/admin", srv.Addr)
+	log.Printf("  Clients API: https://0.0.0.0%s/api/clients", srv.Addr)
+	log.Printf("  Health:      https://0.0.0.0%s/health", srv.Addr)
 
 	done := make(chan struct{})
 	go func() {
@@ -1180,7 +1337,7 @@ func main() {
 		close(done)
 	}()
 
-	if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
+	if err := srv.ServeTLS(ln, certPath("DECODER_SERVER_CERT", "certs/server.pem"), certPath("DECODER_SERVER_KEY", "certs/server-key.pem")); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("serve: %v", err)
 	}
 	<-done

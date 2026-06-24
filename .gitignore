@@ -1,0 +1,23 @@
+# Go build output
+*.exe
+decoder-server
+
+# Local environment — NEVER commit (contains PASETO key and cert paths)
+.env
+.env.local
+.env.production
+.env.staging
+
+# TLS private keys (never commit)
+certs/*-key.pem
+certs/*.key.pem
+
+# Runtime data (server-owned, not in repo)
+audit.jsonl
+presence-log.json
+agent-policy.json
+screenshots/
+screenshots-index.json
+
+# Go module cache
+vendor/
