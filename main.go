@@ -50,12 +50,12 @@ const (
 	pingPeriod       = (pongWait * 9) / 10
 	maxMessageSize   = 10 << 20 // 10 MiB
 	textQueueDepth   = 128      // control/stats messages per admin
-	listDebounce     = 100 * time.Millisecond
+	listDebounce     = 50 * time.Millisecond
 	adminClientIDLen = 36 // UUID string prefix on every binary frame
 
-	appPingInterval = 2 * time.Second
-	appPingTimeout  = 6 * time.Second
-	streamStatsTick = 1 * time.Second
+	appPingInterval = 1 * time.Second
+	appPingTimeout  = 4 * time.Second
+	streamStatsTick = 500 * time.Millisecond
 )
 
 // ─── Shared types ─────────────────────────────────────────────────────────────
