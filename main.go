@@ -53,9 +53,9 @@ const (
 	listDebounce     = 100 * time.Millisecond
 	adminClientIDLen = 36 // UUID string prefix on every binary frame
 
-	appPingInterval = 5 * time.Second
-	appPingTimeout  = 8 * time.Second
-	streamStatsTick = 2 * time.Second
+	appPingInterval = 2 * time.Second
+	appPingTimeout  = 6 * time.Second
+	streamStatsTick = 1 * time.Second
 )
 
 // ─── Shared types ─────────────────────────────────────────────────────────────
@@ -757,7 +757,6 @@ func (h *hub) clearAdminWatch(a *adminConn) {
 func (h *hub) routeFrame(clientID string, data []byte) {
 	h.mu.RLock()
 	watchers := h.watchIndex[clientID]
-	client := h.clients[clientID]
 	if len(watchers) == 0 {
 		h.mu.RUnlock()
 		return
@@ -779,20 +778,11 @@ func (h *hub) routeFrame(clientID string, data []byte) {
 		)
 	}
 
-	replaced := 0
-	sent := 0
 	for _, a := range targets {
-		if a.enqueueFrame(clientID, frame) {
-			replaced++
-		} else {
-			sent++
-		}
+		a.enqueueFrame(clientID, frame)
 	}
-	// Signal backpressure to the client when a significant fraction of frames
-	// are being replaced before delivery (admin is too slow to consume them).
-	if client != nil && (sent+replaced) > 0 {
-		client.noteRoutePressure(uint64(sent), uint64(replaced))
-	}
+	// Latest-frame routing intentionally replaces pending frames — that is not
+	// client backpressure. Adaptive/stream quality uses client-side send metrics.
 }
 
 func (c *clientConn) noteRoutePressure(delivered, dropped uint64) {
