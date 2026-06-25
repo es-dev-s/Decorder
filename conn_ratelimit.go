@@ -37,7 +37,11 @@ func (l *ipConnLimiter) Allow(ip string) bool {
 		}
 	}
 	if len(kept) >= ipConnLimitPerMinute {
-		l.attempts[ip] = kept
+		if len(kept) == 0 {
+			delete(l.attempts, ip)
+		} else {
+			l.attempts[ip] = kept
+		}
 		return false
 	}
 	l.attempts[ip] = append(kept, now)
@@ -76,7 +80,11 @@ func (l *uuidReconnectLimiter) Allow(uuid string) (ok bool, retryAfter time.Dura
 	}
 	if len(kept) >= uuidReconnectPerMinute {
 		l.backoffUntil[uuid] = now.Add(uuidReconnectBackoff)
-		l.attempts[uuid] = kept
+		if len(kept) == 0 {
+			delete(l.attempts, uuid)
+		} else {
+			l.attempts[uuid] = kept
+		}
 		return false, uuidReconnectBackoff
 	}
 	l.attempts[uuid] = append(kept, now)

@@ -23,6 +23,13 @@ func (h *hub) initiateGracefulShutdown() {
 		h.broadcastToAdmins(msg)
 	}
 
+	h.listMu.Lock()
+	if h.listTimer != nil {
+		h.listTimer.Stop()
+		h.listTimer = nil
+	}
+	h.listMu.Unlock()
+
 	close(h.bgDone)
 
 	h.mu.Lock()

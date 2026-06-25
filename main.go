@@ -54,9 +54,10 @@ const (
 	listDebounce     = 50 * time.Millisecond
 	adminClientIDLen = 36 // UUID string prefix on every binary frame
 
-	appPingInterval = 1 * time.Second
-	appPingTimeout  = 4 * time.Second
-	streamStatsTick = 500 * time.Millisecond
+	appPingInterval        = 1 * time.Second
+	appPingTimeout         = 4 * time.Second
+	streamStatsTick        = 500 * time.Millisecond
+	maxFrameBurstPerPoke   = 12 // interleave pings/text during multi-client frame bursts
 )
 
 // ─── Shared types ─────────────────────────────────────────────────────────────
@@ -294,18 +295,62 @@ func (a *adminConn) writePump() {
 			}
 
 		case <-a.framePoke:
-			// Swap out the entire latestFrames map atomically.
-			// Frames that arrive during this loop land in the new map and will
-			// trigger a new poke — they are never lost.
-			a.frameMu.Lock()
-			batch := a.latestFrames
-			a.latestFrames = make(map[string][]byte, len(batch))
-			a.frameMu.Unlock()
+			// Drain up to maxFrameBurstPerPoke frames, yielding to text/ping between
+			// bursts so multi-client streaming cannot stall admin heartbeats.
+		frameBurst:
+			for burst := 0; burst < maxFrameBurstPerPoke; burst++ {
+				a.frameMu.Lock()
+				if len(a.latestFrames) == 0 {
+					a.frameMu.Unlock()
+					break
+				}
+				var frame []byte
+				for cid, f := range a.latestFrames {
+					frame = f
+					delete(a.latestFrames, cid)
+					break
+				}
+				more := len(a.latestFrames) > 0
+				a.frameMu.Unlock()
 
-			for _, frame := range batch {
 				_ = a.conn.SetWriteDeadline(time.Now().Add(writeWait))
 				if err := a.conn.WriteMessage(websocket.BinaryMessage, frame); err != nil {
 					return
+				}
+				if !more {
+					break
+				}
+
+				select {
+				case <-a.done:
+					return
+				case msg, ok := <-a.textSend:
+					if !ok {
+						return
+					}
+					_ = a.conn.SetWriteDeadline(time.Now().Add(writeWait))
+					if err := a.conn.WriteMessage(msg.mt, msg.data); err != nil {
+						return
+					}
+					break frameBurst
+				case <-ticker.C:
+					if a.hb.OnPingSent() {
+						return
+					}
+					_ = a.conn.SetWriteDeadline(time.Now().Add(writeWait))
+					if err := a.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+						return
+					}
+				default:
+				}
+			}
+			a.frameMu.Lock()
+			remaining := len(a.latestFrames) > 0
+			a.frameMu.Unlock()
+			if remaining {
+				select {
+				case a.framePoke <- struct{}{}:
+				default:
 				}
 			}
 
@@ -540,14 +585,16 @@ func (h *hub) checkAdminAppPingTimeouts() {
 
 	for _, a := range admins {
 		if a.appPingExpired() {
-			log.Printf("[appping] admin %s application ping timeout — closing", a.id)
-			a.conn.Close()
-			a.close()
+			log.Printf("[appping] admin %s application ping timeout — evicting", a.id)
+			h.unregisterAdmin(a.id)
 		}
 	}
 }
 
 func (h *hub) broadcastClientLifecycle(msgType, clientID string, ts, wasOfflineMs int64) {
+	if h.shuttingDown.Load() {
+		return
+	}
 	payload := map[string]any{
 		"type":      msgType,
 		"client_id": clientID,
@@ -1031,9 +1078,12 @@ func (h *hub) buildClientListJSONLocked() []byte {
 	for _, c := range h.clients {
 		list = append(list, c.info)
 	}
-	// Sort oldest-connected first so the client list never reorders in the admin UI.
-	sort.Slice(list, func(i, j int) bool {
-		return list[i].ConnectedAt.Before(list[j].ConnectedAt)
+	// Sort oldest-connected first; stable tie-break on ID prevents UI flicker.
+	sort.SliceStable(list, func(i, j int) bool {
+		if !list[i].ConnectedAt.Equal(list[j].ConnectedAt) {
+			return list[i].ConnectedAt.Before(list[j].ConnectedAt)
+		}
+		return list[i].ID < list[j].ID
 	})
 	msg := map[string]any{"type": "client_list", "clients": list}
 	data, _ := json.Marshal(msg)
@@ -1043,6 +1093,9 @@ func (h *hub) buildClientListJSONLocked() []byte {
 // scheduleClientListBroadcast collapses bursts of register/unregister events
 // into a single broadcast fired 100 ms after the LAST event.
 func (h *hub) scheduleClientListBroadcast() {
+	if h.shuttingDown.Load() {
+		return
+	}
 	h.listMu.Lock()
 	h.listVersion++
 	ver := h.listVersion
@@ -1063,6 +1116,9 @@ func (h *hub) scheduleClientListBroadcast() {
 }
 
 func (h *hub) broadcastClientListNow() {
+	if h.shuttingDown.Load() {
+		return
+	}
 	h.mu.RLock()
 	msg := h.buildClientListJSONLocked()
 	admins := make([]*adminConn, 0, len(h.admins))
@@ -1145,6 +1201,11 @@ func configureConn(conn *websocket.Conn, hb *heartbeat.Monitor) {
 // ─── Client handler ──────────────────────────────────────────────────────────
 
 func (h *hub) handleClientWS(w http.ResponseWriter, r *http.Request) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			log.Printf("[panic] client ws handler: %v", rec)
+		}
+	}()
 	if h.shuttingDown.Load() {
 		http.Error(w, "server shutting down", http.StatusServiceUnavailable)
 		return
@@ -1393,6 +1454,11 @@ func (h *hub) handleClientWS(w http.ResponseWriter, r *http.Request) {
 // ─── Admin handler ────────────────────────────────────────────────────────────
 
 func (h *hub) handleAdminWS(w http.ResponseWriter, r *http.Request) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			log.Printf("[panic] admin ws handler: %v", rec)
+		}
+	}()
 	if h.shuttingDown.Load() {
 		http.Error(w, "server shutting down", http.StatusServiceUnavailable)
 		return
@@ -1574,6 +1640,12 @@ func (h *hub) handleAPIClients(w http.ResponseWriter, r *http.Request) {
 	for _, c := range h.clients {
 		list = append(list, c.info)
 	}
+	sort.SliceStable(list, func(i, j int) bool {
+		if !list[i].ConnectedAt.Equal(list[j].ConnectedAt) {
+			return list[i].ConnectedAt.Before(list[j].ConnectedAt)
+		}
+		return list[i].ID < list[j].ID
+	})
 	h.mu.RUnlock()
 	_ = json.NewEncoder(w).Encode(list)
 }
@@ -1644,7 +1716,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.Handle("/ws/client", IPConnRateLimitMiddleware(RateLimitMiddleware(http.HandlerFunc(h.handleClientWS))))
-	mux.HandleFunc("/ws/admin", h.handleAdminWS)
+	mux.Handle("/ws/admin", IPConnRateLimitMiddleware(http.HandlerFunc(h.handleAdminWS)))
 	h.registerEnrolRoute(mux)
 	mux.HandleFunc("/auth/login", h.handleAuthLogin)
 	mux.HandleFunc("/auth/refresh", h.handleAuthRefresh)
