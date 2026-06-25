@@ -174,6 +174,37 @@ func (c *clientConn) writePump() {
 	}
 }
 
+// sendE2EWatcher tells a client that an admin (with its RSA public key) is now
+// watching, so the client can wrap its session key to that admin. Non-blocking.
+func (c *clientConn) sendE2EWatcher(adminID, pubkeyB64 string) {
+	msg, _ := json.Marshal(map[string]string{
+		"type":     "e2e_watcher",
+		"admin_id": adminID,
+		"pubkey":   pubkeyB64,
+	})
+	c.enqueueText(msg)
+}
+
+// sendE2EUnwatch tells a client an admin stopped watching (drop its wrapped key).
+func (c *clientConn) sendE2EUnwatch(adminID string) {
+	msg, _ := json.Marshal(map[string]string{
+		"type":     "e2e_unwatch",
+		"admin_id": adminID,
+	})
+	c.enqueueText(msg)
+}
+
+// routeToAdmin sends a raw text message to a single admin by id (used to relay
+// the client's wrapped session key back to the specific watching admin).
+func (h *hub) routeToAdmin(adminID string, data []byte) {
+	h.mu.RLock()
+	a := h.admins[adminID]
+	h.mu.RUnlock()
+	if a != nil {
+		a.enqueueText(data)
+	}
+}
+
 // sendStreamDemand pushes {"type":"stream_demand","level":"live"|"idle"} to the
 // client.  Non-blocking: uses the same drop-oldest queue as all other control
 // messages.  Must be called WITHOUT h.mu held (I/O enqueued after unlock).
@@ -236,6 +267,23 @@ type adminConn struct {
 	appPingMu     sync.Mutex
 	pendingPingMs int64
 	pingDeadline  time.Time
+
+	// End-to-end encryption: this admin's RSA public key (base64 SPKI DER),
+	// sent once after connect. Empty until received.
+	pubkeyMu sync.RWMutex
+	pubkey   string
+}
+
+func (a *adminConn) setPubkey(b64 string) {
+	a.pubkeyMu.Lock()
+	a.pubkey = b64
+	a.pubkeyMu.Unlock()
+}
+
+func (a *adminConn) getPubkey() string {
+	a.pubkeyMu.RLock()
+	defer a.pubkeyMu.RUnlock()
+	return a.pubkey
 }
 
 func newAdminConn(conn *websocket.Conn) *adminConn {
@@ -692,13 +740,26 @@ func (h *hub) registerClient(c *clientConn) {
 	// Determine initial demand: live if any admin is already watching this client
 	// (e.g. admin was watching before agent reconnected).
 	initialDemand := "idle"
+	type adminKey struct{ id, pubkey string }
+	var e2eWatchers []adminKey
 	if watchers := h.watchIndex[c.info.ID]; len(watchers) > 0 {
 		initialDemand = "live"
+		if E2EEnabled() {
+			for adminID, a := range watchers {
+				if pk := a.getPubkey(); pk != "" {
+					e2eWatchers = append(e2eWatchers, adminKey{adminID, pk})
+				}
+			}
+		}
 	}
 	h.mu.Unlock()
 
 	// Send demand immediately so client knows its streaming mode from the start.
 	c.sendStreamDemand(initialDemand)
+	// Re-establish E2E key wrapping for any admins already watching.
+	for _, w := range e2eWatchers {
+		c.sendE2EWatcher(w.id, w.pubkey)
+	}
 
 	log.Printf("[+] client %-36s  %s@%s  %dx%d@%dfps  demand=%s",
 		c.info.ID, c.info.Username, c.info.Hostname,
@@ -813,9 +874,16 @@ func (h *hub) unregisterAdmin(id string) {
 	h.mu.Lock()
 	a, ok := h.admins[id]
 	nowIdle := make([]*clientConn, 0)
+	e2eDrop := make([]*clientConn, 0)
+	e2eOn := E2EEnabled()
 	if ok {
 		a.watchingMu.Lock()
 		for clientID := range a.watching {
+			if e2eOn {
+				if c := h.clients[clientID]; c != nil {
+					e2eDrop = append(e2eDrop, c)
+				}
+			}
 			if m, exists := h.watchIndex[clientID]; exists {
 				delete(m, id)
 				if len(m) == 0 {
@@ -840,6 +908,9 @@ func (h *hub) unregisterAdmin(id string) {
 
 	for _, c := range nowIdle {
 		c.sendStreamDemand("idle")
+	}
+	for _, c := range e2eDrop {
+		c.sendE2EUnwatch(id)
 	}
 }
 
@@ -873,10 +944,20 @@ func (h *hub) addAdminWatch(a *adminConn, clientID string) {
 	if wasEmpty {
 		target = h.clients[clientID]
 	}
+	// For E2E, the client always needs THIS admin's public key (even if other
+	// admins were already watching) so it can wrap the session key for it.
+	var e2eTarget *clientConn
+	if E2EEnabled() {
+		e2eTarget = h.clients[clientID]
+	}
+	adminPubkey := a.getPubkey()
 	h.mu.Unlock()
 
 	if target != nil {
 		target.sendStreamDemand("live")
+	}
+	if e2eTarget != nil && adminPubkey != "" {
+		e2eTarget.sendE2EWatcher(a.id, adminPubkey)
 	}
 }
 
@@ -900,10 +981,19 @@ func (h *hub) removeAdminWatch(a *adminConn, clientID string) {
 		}
 	}
 	h.reg.RemoveWatch(a.id, clientID)
+	// E2E: tell the client to drop this admin's wrapped key (whether or not it
+	// was the last watcher).
+	var e2eTarget *clientConn
+	if E2EEnabled() {
+		e2eTarget = h.clients[clientID]
+	}
 	h.mu.Unlock()
 
 	if target != nil {
 		target.sendStreamDemand("idle")
+	}
+	if e2eTarget != nil {
+		e2eTarget.sendE2EUnwatch(a.id)
 	}
 }
 
@@ -912,8 +1002,15 @@ func (h *hub) clearAdminWatch(a *adminConn) {
 
 	// Collect client pointers for demand notifications before modifying state.
 	nowIdle := make([]*clientConn, 0)
+	e2eDrop := make([]*clientConn, 0)
+	e2eOn := E2EEnabled()
 	a.watchingMu.Lock()
 	for clientID := range a.watching {
+		if e2eOn {
+			if c := h.clients[clientID]; c != nil {
+				e2eDrop = append(e2eDrop, c)
+			}
+		}
 		if m, ok := h.watchIndex[clientID]; ok {
 			delete(m, a.id)
 			if len(m) == 0 {
@@ -932,6 +1029,9 @@ func (h *hub) clearAdminWatch(a *adminConn) {
 
 	for _, c := range nowIdle {
 		c.sendStreamDemand("idle")
+	}
+	for _, c := range e2eDrop {
+		c.sendE2EUnwatch(a.id)
 	}
 }
 
@@ -1549,6 +1649,17 @@ func (h *hub) handleClientWS(w http.ResponseWriter, r *http.Request) {
 					h.updateClientMonitors(info.ID, mons, uint32(idxF))
 				}
 
+			case "e2e_session_key":
+				// E2E: client wrapped its session key for a specific admin —
+				// route only to that admin. The relay cannot read the key.
+				adminID, _ := msg["admin_id"].(string)
+				if adminID != "" {
+					msg["client_id"] = info.ID
+					if raw, err := json.Marshal(msg); err == nil {
+						h.routeToAdmin(adminID, raw)
+					}
+				}
+
 			case "stream_stats", "cursor":
 				// Route only to admins watching this client.
 				msg["client_id"] = info.ID
@@ -1778,6 +1889,23 @@ func (h *hub) handleAdminWS(w http.ResponseWriter, r *http.Request) {
 
 		case "set_agent_policy":
 			h.handleSetAgentPolicy(cmd)
+
+		case "admin_pubkey":
+			// E2E: store this admin's RSA public key so clients can wrap their
+			// session keys to it. Re-assert e2e_watcher for everything it watches.
+			if pk, _ := cmd["pubkey"].(string); pk != "" {
+				a.setPubkey(pk)
+				if E2EEnabled() {
+					for _, clientID := range a.watchedClients() {
+						h.mu.RLock()
+						c := h.clients[clientID]
+						h.mu.RUnlock()
+						if c != nil {
+							c.sendE2EWatcher(a.id, pk)
+						}
+					}
+				}
+			}
 		}
 	}
 }
@@ -1803,19 +1931,14 @@ func (h *hub) handleAPIClients(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *hub) handleHealth(w http.ResponseWriter, _ *http.Request) {
-	h.mu.RLock()
-	nClients := len(h.clients)
-	nAdmins := len(h.admins)
-	h.mu.RUnlock()
+	// Public liveness endpoint (used by the hosting platform health check).
+	// Deliberately minimal — no client/admin counts, goroutine counts, or
+	// build/version info, to avoid leaking operational details to the internet.
+	// Authenticated operators use /api/status and /metrics for detail.
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"status":       "ok",
-		"clients":      nClients,
-		"admins":       nAdmins,
-		"goroutines":   runtime.NumGoroutine(),
-		"active_conns": h.activeConns.Load(),
-		"uptime_sec":   int(time.Since(h.startTime).Seconds()),
-		"go_version":   runtime.Version(),
+		"status":     "ok",
+		"uptime_sec": int(time.Since(h.startTime).Seconds()),
 	})
 }
 
@@ -1899,6 +2022,13 @@ func main() {
 		WriteTimeout:      0,
 		IdleTimeout:       120 * time.Second,
 		MaxHeaderBytes:    1 << 20,
+	}
+
+	// Fail-closed guard: when DECODER_REQUIRE_TLS=1, refuse to start in plain-HTTP
+	// mode. This prevents an accidental cert/config mistake from silently serving
+	// the relay without Go-native TLS (defense against downgrade on direct hosting).
+	if os.Getenv("DECODER_REQUIRE_TLS") == "1" && !useTLS {
+		log.Fatalf("DECODER_REQUIRE_TLS=1 but server certs are missing/unreadable — refusing to start in plain HTTP mode")
 	}
 
 	ln, err := net.Listen("tcp", srv.Addr)

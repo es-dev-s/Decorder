@@ -20,9 +20,16 @@ type AuditEvent struct {
 	Reason     string    `json:"reason,omitempty"`
 }
 
+// auditMaxBytes is the rotation threshold. When the active log exceeds this, it
+// is rotated to "<path>.1" (single generation) so the audit trail cannot grow
+// unbounded and exhaust disk on a long-running cloud host.
+const auditMaxBytes int64 = 16 << 20 // 16 MiB
+
 var (
-	auditMu  sync.Mutex
-	auditFile *os.File
+	auditMu    sync.Mutex
+	auditFile  *os.File
+	auditPath  string
+	auditBytes int64
 )
 
 func initAuditLog(path string) {
@@ -33,8 +40,36 @@ func initAuditLog(path string) {
 	}
 	auditMu.Lock()
 	auditFile = f
+	auditPath = path
+	if fi, statErr := f.Stat(); statErr == nil {
+		auditBytes = fi.Size()
+	}
 	auditMu.Unlock()
-	log.Printf("[audit] logging to %s", path)
+	log.Printf("[audit] logging to %s (rotate at %d MiB)", path, auditMaxBytes>>20)
+}
+
+// rotateAuditLocked rotates the audit log when it exceeds auditMaxBytes.
+// Caller must hold auditMu. Best-effort: on any failure the current file is kept.
+func rotateAuditLocked() {
+	if auditFile == nil || auditPath == "" || auditBytes < auditMaxBytes {
+		return
+	}
+	_ = auditFile.Close()
+	// Single-generation rotation: overwrite the previous .1 backup.
+	if err := os.Rename(auditPath, auditPath+".1"); err != nil {
+		// Reopen the original so logging continues even if rotation failed.
+		if f, e := os.OpenFile(auditPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600); e == nil {
+			auditFile = f
+		}
+		return
+	}
+	f, err := os.OpenFile(auditPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+	if err != nil {
+		auditFile = nil
+		return
+	}
+	auditFile = f
+	auditBytes = 0
 }
 
 // Audit writes one JSON line to the audit log.
@@ -50,5 +85,11 @@ func Audit(e AuditEvent) {
 	if auditFile == nil {
 		return
 	}
-	_, _ = auditFile.Write(append(b, '\n'))
+	rotateAuditLocked()
+	if auditFile == nil {
+		return
+	}
+	line := append(b, '\n')
+	n, _ := auditFile.Write(line)
+	auditBytes += int64(n)
 }

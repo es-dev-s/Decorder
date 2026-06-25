@@ -15,6 +15,14 @@ func MtlsRequired() bool {
 	return os.Getenv("DECODER_MTLS_ENABLED") == "1"
 }
 
+// E2EEnabled is true when DECODER_E2E=1. When enabled, the relay drives
+// end-to-end frame encryption: it forwards each watching admin's public key to
+// the client, routes the client's wrapped session keys back to that admin, and
+// relays encrypted frames verbatim (it never holds the session key).
+func E2EEnabled() bool {
+	return os.Getenv("DECODER_E2E") == "1"
+}
+
 // clientAuth controls whether the server requires a client cert.
 //
 // Phase 1.2: tls.NoClientCert (certs not yet issued)

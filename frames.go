@@ -50,6 +50,13 @@ func normalizeClientFrame(data []byte) ([]byte, error) {
 		return data, nil
 	}
 
+	// End-to-end encrypted frames are relayed VERBATIM. The relay never holds the
+	// session key and must never attempt to decrypt — it forwards the full
+	// client-v1 frame (header + nonce + ciphertext) so only the admin can decrypt.
+	if version == frameVersionEnc {
+		return data, nil
+	}
+
 	w := binary.LittleEndian.Uint32(data[9:13])
 	h := binary.LittleEndian.Uint32(data[13:17])
 	ts := binary.LittleEndian.Uint64(data[17:25])
@@ -57,20 +64,7 @@ func normalizeClientFrame(data []byte) ([]byte, error) {
 	cx := int32(binary.LittleEndian.Uint32(data[29:33]))
 	cy := int32(binary.LittleEndian.Uint32(data[33:37]))
 
-	var jpeg []byte
-	var err error
-	if version == frameVersionEnc {
-		if frameDecryptKey == nil {
-			return nil, fmt.Errorf("encrypted frame but DECODER_FRAME_KEY not set")
-		}
-		seq := binary.LittleEndian.Uint64(data[1:9])
-		jpeg, err = decryptFramePayload(frameDecryptKey, seq, data[clientFrameHeaderLen:])
-		if err != nil {
-			return nil, err
-		}
-	} else {
-		jpeg = data[clientFrameHeaderLen:]
-	}
+	jpeg := data[clientFrameHeaderLen:]
 
 	out := make([]byte, adminFrameHeaderLen+len(jpeg))
 	binary.LittleEndian.PutUint32(out[0:4], w)
