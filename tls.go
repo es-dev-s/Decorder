@@ -10,6 +10,11 @@ import (
 	"os"
 )
 
+// MtlsRequired is true when DECODER_MTLS_ENABLED=1.
+func MtlsRequired() bool {
+	return os.Getenv("DECODER_MTLS_ENABLED") == "1"
+}
+
 // clientAuth controls whether the server requires a client cert.
 //
 // Phase 1.2: tls.NoClientCert (certs not yet issued)

@@ -251,8 +251,14 @@ func (h *hub) handleScreenshotUpload(w http.ResponseWriter, r *http.Request) {
 
 	clientID := r.Header.Get("X-Client-Id")
 	screenshotID := r.Header.Get("X-Screenshot-Id")
+	uploadToken := r.Header.Get("X-Upload-Token")
 	if clientID == "" || screenshotID == "" {
 		http.Error(w, "missing client or screenshot id", http.StatusBadRequest)
+		return
+	}
+	if !validateUploadToken(clientID, uploadToken) {
+		log.Printf("[auth] rejected screenshot upload client_id=%s reason=invalid_upload_token", clientID)
+		http.Error(w, "invalid upload token", http.StatusUnauthorized)
 		return
 	}
 

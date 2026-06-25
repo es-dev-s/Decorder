@@ -36,6 +36,12 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
+
+	"decoder-server/internal/heartbeat"
+	"decoder-server/internal/observability"
+	"decoder-server/internal/protocol"
+	"decoder-server/internal/registry"
+	"decoder-server/internal/streamstats"
 )
 
 const (
@@ -46,6 +52,10 @@ const (
 	textQueueDepth   = 128      // control/stats messages per admin
 	listDebounce     = 100 * time.Millisecond
 	adminClientIDLen = 36 // UUID string prefix on every binary frame
+
+	appPingInterval = 5 * time.Second
+	appPingTimeout  = 8 * time.Second
+	streamStatsTick = 2 * time.Second
 )
 
 // ─── Shared types ─────────────────────────────────────────────────────────────
@@ -89,6 +99,12 @@ type clientConn struct {
 	conn *websocket.Conn
 	send chan wsMsg // outbound text/control messages from server → client
 	done chan struct{}
+	hb   *heartbeat.Monitor
+
+	connectedAt   time.Time
+	framesRelayed atomic.Uint64
+	remoteIP      string
+	enrolled      bool
 
 	pressureMu       sync.Mutex
 	pressureRouted   uint64
@@ -106,6 +122,7 @@ func newClientConn(info ClientInfo, conn *websocket.Conn) *clientConn {
 		conn: conn,
 		send: make(chan wsMsg, 32),
 		done: make(chan struct{}),
+		hb:   heartbeat.NewMonitor("client=" + info.ID),
 	}
 	go c.writePump()
 	return c
@@ -120,7 +137,7 @@ func (c *clientConn) close() {
 }
 
 func (c *clientConn) writePump() {
-	ticker := time.NewTicker(pingPeriod)
+	ticker := time.NewTicker(heartbeat.PingPeriod())
 	defer ticker.Stop()
 	defer c.conn.Close()
 	for {
@@ -136,6 +153,9 @@ func (c *clientConn) writePump() {
 				return
 			}
 		case <-ticker.C:
+			if c.hb.OnPingSent() {
+				return
+			}
 			_ = c.conn.SetWriteDeadline(time.Now().Add(writeWait))
 			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
 				return
@@ -179,6 +199,7 @@ type adminConn struct {
 	id         string
 	conn       *websocket.Conn
 	done       chan struct{}
+	hb         *heartbeat.Monitor
 	watchingMu sync.RWMutex
 	watching   map[string]struct{}
 
@@ -188,14 +209,21 @@ type adminConn struct {
 	// Per-client latest video frame. Shared byte slice (immutable after build).
 	frameMu      sync.Mutex
 	latestFrames map[string][]byte // clientID → pre-built admin frame (uuid+jpeg)
-	framePoke    chan struct{}       // capacity 1; wakes write pump
+	framePoke    chan struct{}     // capacity 1; wakes write pump
+
+	// Application-level ping (separate from WebSocket protocol ping).
+	appPingMu     sync.Mutex
+	pendingPingMs int64
+	pingDeadline  time.Time
 }
 
 func newAdminConn(conn *websocket.Conn) *adminConn {
+	id := uuid.New().String()
 	a := &adminConn{
-		id:           uuid.New().String(),
+		id:           id,
 		conn:         conn,
 		done:         make(chan struct{}),
+		hb:           heartbeat.NewMonitor("admin=" + id),
 		watching:     make(map[string]struct{}),
 		textSend:     make(chan wsMsg, textQueueDepth),
 		latestFrames: make(map[string][]byte),
@@ -213,10 +241,40 @@ func (a *adminConn) close() {
 	}
 }
 
+func (a *adminConn) prepareServerPing() []byte {
+	ts := protocol.NowMs()
+	raw, err := protocol.MarshalServerPing(ts)
+	if err != nil {
+		return nil
+	}
+	a.appPingMu.Lock()
+	a.pendingPingMs = ts
+	a.pingDeadline = time.Now().Add(appPingTimeout)
+	a.appPingMu.Unlock()
+	return raw
+}
+
+func (a *adminConn) handleAdminPing(ts int64) {
+	a.appPingMu.Lock()
+	if a.pendingPingMs != 0 && ts == a.pendingPingMs {
+		a.pendingPingMs = 0
+	}
+	a.appPingMu.Unlock()
+}
+
+func (a *adminConn) appPingExpired() bool {
+	a.appPingMu.Lock()
+	defer a.appPingMu.Unlock()
+	if a.pendingPingMs == 0 {
+		return false
+	}
+	return time.Now().After(a.pingDeadline)
+}
+
 // writePump serialises all writes to the admin WebSocket.
 // It handles three independent sources: text messages, video frames, and pings.
 func (a *adminConn) writePump() {
-	ticker := time.NewTicker(pingPeriod)
+	ticker := time.NewTicker(heartbeat.PingPeriod())
 	defer ticker.Stop()
 	defer a.conn.Close()
 
@@ -251,6 +309,9 @@ func (a *adminConn) writePump() {
 			}
 
 		case <-ticker.C:
+			if a.hb.OnPingSent() {
+				return
+			}
 			_ = a.conn.SetWriteDeadline(time.Now().Add(writeWait))
 			if err := a.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
 				return
@@ -348,6 +409,9 @@ type hub struct {
 	clients    map[string]*clientConn
 	admins     map[string]*adminConn
 	watchIndex map[string]map[string]*adminConn // clientID → adminID → admin
+	reg        *registry.Registry
+	streamStats *streamstats.Registry
+	bgDone     chan struct{}
 
 	// Reset-based debounced client_list broadcast.
 	listMu      sync.Mutex
@@ -360,6 +424,10 @@ type hub struct {
 
 	activeConns atomic.Int64
 	startTime   time.Time
+
+	shuttingDown atomic.Bool
+	relayReady   atomic.Bool
+	frameSample  atomic.Uint64
 }
 
 func newHub() *hub {
@@ -370,9 +438,128 @@ func newHub() *hub {
 		presence:   newPresenceStore(),
 		startTime:  time.Now(),
 	}
+	h.reg = registry.New(registry.Events{
+		OnClientOffline: func(clientID string, ts int64) {
+			h.broadcastClientLifecycle("client_offline", clientID, ts, 0)
+		},
+		OnClientReconnected: func(clientID string, wasOfflineMs int64) {
+			h.broadcastClientLifecycle("client_reconnected", clientID, time.Now().UnixMilli(), wasOfflineMs)
+		},
+	})
 	h.screenshots = newScreenshotStore(h.broadcastScreenshot)
 	h.policy = loadPolicyStore()
+	h.streamStats = streamstats.NewRegistry()
+	h.bgDone = make(chan struct{})
+	h.relayReady.Store(true)
+	h.startBackgroundTasks()
 	return h
+}
+
+func (h *hub) startBackgroundTasks() {
+	go h.streamStatsLoop()
+	go h.adminAppPingLoop()
+}
+
+func (h *hub) streamStatsLoop() {
+	ticker := time.NewTicker(streamStatsTick)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-h.bgDone:
+			return
+		case <-ticker.C:
+			h.publishStreamStats()
+		}
+	}
+}
+
+func (h *hub) publishStreamStats() {
+	h.mu.RLock()
+	clientIDs := make([]string, 0, len(h.watchIndex))
+	for cid, watchers := range h.watchIndex {
+		if len(watchers) > 0 {
+			clientIDs = append(clientIDs, cid)
+		}
+	}
+	h.mu.RUnlock()
+
+	for _, clientID := range clientIDs {
+		snap, ok := h.streamStats.Snapshot(clientID)
+		if !ok {
+			continue
+		}
+		raw, err := protocol.MarshalStreamStatsFlat(snap)
+		if err != nil {
+			continue
+		}
+		h.broadcastToWatchers(clientID, raw)
+	}
+}
+
+func (h *hub) adminAppPingLoop() {
+	sendTicker := time.NewTicker(appPingInterval)
+	checkTicker := time.NewTicker(1 * time.Second)
+	defer sendTicker.Stop()
+	defer checkTicker.Stop()
+
+	for {
+		select {
+		case <-h.bgDone:
+			return
+		case <-sendTicker.C:
+			h.sendAdminServerPings()
+		case <-checkTicker.C:
+			h.checkAdminAppPingTimeouts()
+		}
+	}
+}
+
+func (h *hub) sendAdminServerPings() {
+	h.mu.RLock()
+	admins := make([]*adminConn, 0, len(h.admins))
+	for _, a := range h.admins {
+		admins = append(admins, a)
+	}
+	h.mu.RUnlock()
+
+	for _, a := range admins {
+		if raw := a.prepareServerPing(); len(raw) > 0 {
+			a.enqueueText(raw)
+		}
+	}
+}
+
+func (h *hub) checkAdminAppPingTimeouts() {
+	h.mu.RLock()
+	admins := make([]*adminConn, 0, len(h.admins))
+	for _, a := range h.admins {
+		admins = append(admins, a)
+	}
+	h.mu.RUnlock()
+
+	for _, a := range admins {
+		if a.appPingExpired() {
+			log.Printf("[appping] admin %s application ping timeout — closing", a.id)
+			a.conn.Close()
+			a.close()
+		}
+	}
+}
+
+func (h *hub) broadcastClientLifecycle(msgType, clientID string, ts, wasOfflineMs int64) {
+	payload := map[string]any{
+		"type":      msgType,
+		"client_id": clientID,
+		"ts":        ts,
+	}
+	if wasOfflineMs > 0 {
+		payload["was_offline_ms"] = wasOfflineMs
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return
+	}
+	h.broadcastToAdmins(raw)
 }
 
 func (h *hub) registerClient(c *clientConn) {
@@ -385,6 +572,21 @@ func (h *hub) registerClient(c *clientConn) {
 	log.Printf("[+] client %-36s  %s@%s  %dx%d@%dfps",
 		c.info.ID, c.info.Username, c.info.Hostname,
 		c.info.Width, c.info.Height, c.info.FPS)
+
+	infoJSON, _ := json.Marshal(c.info)
+	meta := registry.ClientMeta{InfoJSON: infoJSON}
+	if monRaw, err := json.Marshal(c.info.Monitors); err == nil {
+		meta.MonitorInfo = monRaw
+	}
+	h.reg.RegisterClient(c.info.ID, meta)
+
+	h.syncMetricGauges()
+	observability.Event("relay", "client_connected",
+		"client_id", c.info.ID,
+		"ip", c.remoteIP,
+		"enrolled", c.enrolled,
+	)
+
 	h.scheduleClientListBroadcast()
 }
 
@@ -401,13 +603,30 @@ func (h *hub) unregisterClient(id string, c *clientConn) {
 			a.watchingMu.Lock()
 			delete(a.watching, id)
 			a.watchingMu.Unlock()
-			// Remove pending frames for this client so no stale data lingers.
 			a.removeClientFrames(id)
 			delete(watchers, adminID)
 		}
 		delete(h.watchIndex, id)
 	}
+	info := c.info
 	h.mu.Unlock()
+
+	infoJSON, _ := json.Marshal(info)
+	meta := registry.ClientMeta{InfoJSON: infoJSON}
+	if monRaw, err := json.Marshal(info.Monitors); err == nil {
+		meta.MonitorInfo = monRaw
+	}
+	h.reg.UnregisterClient(id, meta)
+	h.streamStats.Remove(id)
+	h.syncMetricGauges()
+
+	durationS := int(time.Since(c.connectedAt).Seconds())
+	observability.Event("relay", "client_disconnected",
+		"client_id", id,
+		"duration_s", durationS,
+		"frames_relayed", c.framesRelayed.Load(),
+	)
+
 	log.Printf("[-] client %s", id)
 	h.scheduleClientListBroadcast()
 }
@@ -417,6 +636,9 @@ func (h *hub) registerAdmin(a *adminConn) {
 	h.admins[a.id] = a
 	list := h.buildClientListJSONLocked()
 	h.mu.Unlock()
+	h.reg.RegisterAdmin(a.id)
+	h.syncMetricGauges()
+	observability.Event("relay", "admin_connected", "admin_id", a.id)
 	log.Printf("[+] admin  %s", a.id)
 	a.enqueueText(list)
 	h.sendPresenceSnapshot(a)
@@ -461,6 +683,8 @@ func (h *hub) unregisterAdmin(id string) {
 		delete(h.admins, id)
 	}
 	h.mu.Unlock()
+	h.reg.UnregisterAdmin(id)
+	h.syncMetricGauges()
 	if ok {
 		a.close()
 	}
@@ -482,6 +706,7 @@ func (h *hub) addAdminWatch(a *adminConn, clientID string) {
 		h.watchIndex[clientID] = make(map[string]*adminConn)
 	}
 	h.watchIndex[clientID][a.id] = a
+	h.reg.AddWatch(a.id, clientID)
 }
 
 func (h *hub) removeAdminWatch(a *adminConn, clientID string) {
@@ -502,6 +727,7 @@ func (h *hub) removeAdminWatch(a *adminConn, clientID string) {
 			delete(h.watchIndex, clientID)
 		}
 	}
+	h.reg.RemoveWatch(a.id, clientID)
 }
 
 func (h *hub) clearAdminWatch(a *adminConn) {
@@ -520,6 +746,7 @@ func (h *hub) clearAdminWatch(a *adminConn) {
 	}
 	a.watching = make(map[string]struct{})
 	a.watchingMu.Unlock()
+	h.reg.ClearWatch(a.id)
 }
 
 // routeFrame delivers a JPEG frame from clientID to every watching admin.
@@ -543,6 +770,14 @@ func (h *hub) routeFrame(clientID string, data []byte) {
 
 	// Build once, share across all watchers.
 	frame := buildAdminFrame(clientID, data)
+	observability.IncFramesRelayed(1)
+	observability.IncBytesRelayed(uint64(len(data)))
+	if h.frameSample.Add(1)%100 == 0 {
+		observability.Event("relay", "frame_relayed",
+			"client_id", clientID,
+			"bytes", len(data),
+		)
+	}
 
 	replaced := 0
 	sent := 0
@@ -869,19 +1104,29 @@ var clientUpgrader = websocket.Upgrader{
 var adminUpgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool {
 		o := r.Header.Get("Origin")
-		if o == "" {
-			return true // same-origin or non-browser client
+		if o == "" || o == "null" {
+			return true // Rust-side WS client, same-origin, or sandboxed webview
 		}
 		// Production Tauri app — both WebView2 and WKWebView origins.
 		if o == "tauri://localhost" || o == "https://tauri.localhost" {
 			return true
 		}
-		// Tauri dev mode: Vite dev server on localhost (any port).
+		// Tauri dev mode: Vite dev server (localhost or 127.0.0.1, any port).
 		// Identity is enforced by mTLS when certs are present; origin
 		// is a secondary hint, not the primary auth mechanism.
-		if strings.HasPrefix(o, "http://localhost:") || strings.HasPrefix(o, "https://localhost:") {
-			return true
+		for _, prefix := range []string{
+			"http://localhost:",
+			"https://localhost:",
+			"http://127.0.0.1:",
+			"https://127.0.0.1:",
+			"http://ipc.localhost",
+			"https://ipc.localhost",
+		} {
+			if strings.HasPrefix(o, prefix) {
+				return true
+			}
 		}
+		log.Printf("[ws] admin origin rejected: %q", o)
 		return false
 	},
 	ReadBufferSize:    4096,
@@ -892,17 +1137,35 @@ var adminUpgrader = websocket.Upgrader{
 // upgrader retained for non-WS handlers; use clientUpgrader/adminUpgrader for WS.
 var upgrader = clientUpgrader
 
-func configureConn(conn *websocket.Conn) {
+func configureConn(conn *websocket.Conn, hb *heartbeat.Monitor) {
 	conn.SetReadLimit(maxMessageSize)
-	_ = conn.SetReadDeadline(time.Now().Add(pongWait))
+	deadline := heartbeat.ReadDeadline()
+	_ = conn.SetReadDeadline(time.Now().Add(deadline))
 	conn.SetPongHandler(func(string) error {
-		return conn.SetReadDeadline(time.Now().Add(pongWait))
+		hb.Touch()
+		return conn.SetReadDeadline(time.Now().Add(deadline))
 	})
 }
 
 // ─── Client handler ──────────────────────────────────────────────────────────
 
 func (h *hub) handleClientWS(w http.ResponseWriter, r *http.Request) {
+	if h.shuttingDown.Load() {
+		http.Error(w, "server shutting down", http.StatusServiceUnavailable)
+		return
+	}
+	ip := clientIP(r)
+	if MtlsRequired() {
+		if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
+			log.Printf("[auth] rejected unauthenticated client, mtls_required=true client_ip=%s", ip)
+			observability.Event("auth", "auth_rejected", "ip", ip, "reason", "mtls_required")
+			http.Error(w, "client certificate required", http.StatusUnauthorized)
+			return
+		}
+	} else {
+		authDebug("[auth] mtls_disabled, accepting client by hello UUID client_ip=%s", ip)
+	}
+
 	// Phase 1.5: when mTLS is enabled, verify the client cert CN matches the
 	// device ID sent in the hello message.  The check uses the pre-registered
 	// device ID — we defer to post-hello validation inside the loop.
@@ -911,11 +1174,11 @@ func (h *hub) handleClientWS(w http.ResponseWriter, r *http.Request) {
 		log.Printf("client upgrade: %v", err)
 		return
 	}
-	configureConn(conn)
+	conn.SetReadLimit(maxMessageSize)
 	h.activeConns.Add(1)
 	defer h.activeConns.Add(-1)
 
-	_ = conn.SetReadDeadline(time.Now().Add(pongWait))
+	_ = conn.SetReadDeadline(time.Now().Add(heartbeat.ReadDeadline()))
 	_, raw, err := conn.ReadMessage()
 	if err != nil {
 		conn.Close()
@@ -942,7 +1205,33 @@ func (h *hub) handleClientWS(w http.ResponseWriter, r *http.Request) {
 	}
 	if hello.ID == "" {
 		hello.ID = uuid.New().String()
+	} else if err := validateClientUUID(hello.ID); err != nil {
+		log.Printf("[auth] rejected invalid client_id=%q client_ip=%s: %v", hello.ID, ip, err)
+		_ = conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.ClosePolicyViolation, "invalid_client_id"))
+		conn.Close()
+		return
 	}
+
+	if ok, retryAfter := globalUUIDReconnectLimiter.Allow(hello.ID); !ok {
+		log.Printf("[auth] rejected rate-limited reconnect client_id=%s client_ip=%s retry_after=%s", hello.ID, ip, retryAfter)
+		_ = conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseTryAgainLater, "reconnect_rate_limited"))
+		conn.Close()
+		return
+	}
+
+	h.mu.Lock()
+	if old, ok := h.clients[hello.ID]; ok {
+		if old.hb.IsAlive(30 * time.Second) {
+			h.mu.Unlock()
+			log.Printf("[auth] rejected duplicate client_id=%s client_ip=%s reason=still_connected", hello.ID, ip)
+			_ = conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(4001, "duplicate_client_id"))
+			conn.Close()
+			return
+		}
+		old.close()
+		delete(h.clients, hello.ID)
+	}
+	h.mu.Unlock()
 
 	// mTLS identity check: when enabled, the cert CN must match the claimed ID.
 	if clientAuth == tls.RequireAndVerifyClientCert {
@@ -983,6 +1272,11 @@ func (h *hub) handleClientWS(w http.ResponseWriter, r *http.Request) {
 	}
 
 	c := newClientConn(info, conn)
+	c.connectedAt = time.Now()
+	c.remoteIP = ip
+	c.enrolled = PeerCertCN(r) != ""
+	configureConn(conn, c.hb)
+	c.hb.Touch()
 	h.registerClient(c)
 	h.pushPolicyToClient(c)
 	Audit(AuditEvent{
@@ -1004,13 +1298,16 @@ func (h *hub) handleClientWS(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	for {
-		_ = conn.SetReadDeadline(time.Now().Add(pongWait))
+		_ = conn.SetReadDeadline(time.Now().Add(heartbeat.ReadDeadline()))
 		mt, data, err := conn.ReadMessage()
 		if err != nil {
 			break
 		}
+		c.hb.Touch()
+		h.reg.TouchClient(info.ID)
 		switch mt {
 		case websocket.BinaryMessage:
+			h.streamStats.Record(info.ID, data)
 			// Read version byte (byte 0) for replay guard (Phase 2.2).
 			// Version 0x01 = plain, 0x02 = AES-GCM encrypted.
 			// The server relays the entire message as-is — it never decrypts.
@@ -1026,7 +1323,13 @@ func (h *hub) handleClientWS(w http.ResponseWriter, r *http.Request) {
 				})
 				continue
 			}
-			h.routeFrame(info.ID, data)
+			normalized, err := normalizeClientFrame(data)
+			if err != nil {
+				log.Printf("[frame] %s normalize: %v — dropping", info.ID, err)
+				continue
+			}
+			c.framesRelayed.Add(1)
+			h.routeFrame(info.ID, normalized)
 
 		case websocket.TextMessage:
 			var msg map[string]any
@@ -1062,8 +1365,27 @@ func (h *hub) handleClientWS(w http.ResponseWriter, r *http.Request) {
 					}
 				}
 
-			case "presence_sync":
+			case "presence_sync", "presence_batch":
 				h.handlePresenceSync(info.ID, msg)
+
+			case "agent_reconnected":
+				offlineMs, _ := msg["offline_ms"].(float64)
+				attempt, _ := msg["attempt"].(float64)
+				log.Printf("[agent] %s reconnected (attempt=%v offline_ms=%v)", info.ID, attempt, offlineMs)
+				observability.IncClientReconnects()
+				observability.Event("relay", "client_reconnected",
+					"client_id", info.ID,
+					"offline_ms", int64(offlineMs),
+					"attempt", int(attempt),
+				)
+				if raw, err := json.Marshal(map[string]any{
+					"type":       "agent_reconnected",
+					"client_id":  info.ID,
+					"offline_ms": offlineMs,
+					"attempt":    attempt,
+				}); err == nil {
+					h.broadcastToWatchers(info.ID, raw)
+				}
 
 			case "session_state":
 				locked, _ := msg["session_locked"].(bool)
@@ -1076,6 +1398,10 @@ func (h *hub) handleClientWS(w http.ResponseWriter, r *http.Request) {
 // ─── Admin handler ────────────────────────────────────────────────────────────
 
 func (h *hub) handleAdminWS(w http.ResponseWriter, r *http.Request) {
+	if h.shuttingDown.Load() {
+		http.Error(w, "server shutting down", http.StatusServiceUnavailable)
+		return
+	}
 	// Phase 1.5: when mTLS is enabled, verify admin cert identity.
 	if clientAuth == tls.RequireAndVerifyClientCert {
 		if err := VerifyAdminIdentity(r); err != nil {
@@ -1090,7 +1416,7 @@ func (h *hub) handleAdminWS(w http.ResponseWriter, r *http.Request) {
 		log.Printf("admin upgrade: %v", err)
 		return
 	}
-	configureConn(conn)
+	conn.SetReadLimit(maxMessageSize)
 	h.activeConns.Add(1)
 	defer h.activeConns.Add(-1)
 
@@ -1137,6 +1463,8 @@ func (h *hub) handleAdminWS(w http.ResponseWriter, r *http.Request) {
 	}
 
 	a := newAdminConn(conn)
+	configureConn(conn, a.hb)
+	a.hb.Touch()
 	h.registerAdmin(a)
 	Audit(AuditEvent{
 		EventType:  "admin_connect",
@@ -1156,17 +1484,23 @@ func (h *hub) handleAdminWS(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	for {
-		_ = conn.SetReadDeadline(time.Now().Add(pongWait))
+		_ = conn.SetReadDeadline(time.Now().Add(heartbeat.ReadDeadline()))
 		_, raw, err := conn.ReadMessage()
 		if err != nil {
 			break
 		}
+		a.hb.Touch()
+		h.reg.TouchAdmin(a.id)
 		var cmd map[string]any
 		if err := json.Unmarshal(raw, &cmd); err != nil {
 			continue
 		}
 
 		switch cmd["type"] {
+		case string(protocol.MsgAdminPing):
+			tsF, _ := cmd["ts"].(float64)
+			a.handleAdminPing(int64(tsF))
+
 		case "watch":
 			clientID, _ := cmd["client_id"].(string)
 			if clientID != "" {
@@ -1266,6 +1600,17 @@ func (h *hub) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	})
 }
 
+func (h *hub) handleAPIStatus(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"connected_clients": h.reg.ClientCount(),
+		"connected_admins":  h.reg.AdminCount(),
+		"grace_clients":     h.reg.GraceCount(),
+		"server_uptime_s":   int(h.reg.Uptime().Seconds()),
+		"relay_ok":          h.relayReady.Load() && !h.shuttingDown.Load(),
+	})
+}
+
 // ─── main ─────────────────────────────────────────────────────────────────────
 
 const defaultPort = "8090"
@@ -1298,10 +1643,12 @@ func main() {
 		log.Println("[auth] DECODER_PASETO_KEY not set — token auth disabled (dev mode)")
 	}
 
+	initFrameCrypto()
+
 	h := newHub()
 
 	mux := http.NewServeMux()
-	mux.Handle("/ws/client", RateLimitMiddleware(http.HandlerFunc(h.handleClientWS)))
+	mux.Handle("/ws/client", IPConnRateLimitMiddleware(RateLimitMiddleware(http.HandlerFunc(h.handleClientWS))))
 	mux.HandleFunc("/ws/admin", h.handleAdminWS)
 	h.registerEnrolRoute(mux)
 	mux.HandleFunc("/auth/login", h.handleAuthLogin)
@@ -1312,6 +1659,10 @@ func main() {
 	mux.HandleFunc("/api/screenshots/file/", h.handleAPIScreenshotFile)
 	mux.HandleFunc("/api/screenshots", h.handleAPIScreenshots)
 	mux.HandleFunc("/health", h.handleHealth)
+	mux.HandleFunc("/healthz", h.handleHealthz)
+	mux.HandleFunc("/readyz", h.handleReadyz)
+	mux.HandleFunc("/metrics", h.handleMetrics)
+	mux.HandleFunc("/api/status", h.handleAPIStatus)
 
 	tlsCfg := BuildTLSConfig()
 	useTLS := tlsCfg != nil
@@ -1342,14 +1693,15 @@ func main() {
 		log.Printf("  Admin WS:    ws://0.0.0.0%s/ws/admin   (proxied as wss://)", srv.Addr)
 		log.Printf("  NOTE: run certs/init-ca.sh to enable Go-native mTLS")
 	}
-	log.Printf("  Health:      http://0.0.0.0%s/health", srv.Addr)
+	log.Printf("  Health:      http://0.0.0.0%s/health  (/healthz /readyz /metrics)", srv.Addr)
 
 	done := make(chan struct{})
 	go func() {
 		quit := make(chan os.Signal, 1)
 		signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 		sig := <-quit
-		log.Printf("Signal %s — shutting down (15 s drain)", sig)
+		log.Printf("Signal %s — graceful shutdown", sig)
+		h.initiateGracefulShutdown()
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 		if err := srv.Shutdown(ctx); err != nil {
