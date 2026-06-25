@@ -32,7 +32,9 @@ func (h *hub) syncMetricGauges() {
 	h.mu.RLock()
 	nClients := len(h.clients)
 	nAdmins := len(h.admins)
+	nLive := len(h.watchIndex)
 	h.mu.RUnlock()
 	observability.SetClientsConnected(int64(nClients))
 	observability.SetAdminsConnected(int64(nAdmins))
+	observability.SetLiveStreams(int64(nLive))
 }

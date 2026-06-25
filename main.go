@@ -54,10 +54,18 @@ const (
 	listDebounce     = 50 * time.Millisecond
 	adminClientIDLen = 36 // UUID string prefix on every binary frame
 
-	appPingInterval        = 1 * time.Second
-	appPingTimeout         = 4 * time.Second
-	streamStatsTick        = 500 * time.Millisecond
-	maxFrameBurstPerPoke   = 12 // interleave pings/text during multi-client frame bursts
+	appPingInterval      = 1 * time.Second
+	appPingTimeout       = 4 * time.Second
+	streamStatsTick      = 500 * time.Millisecond
+	maxFrameBurstPerPoke = 12 // interleave pings/text during multi-client frame bursts
+
+	// Scale limits for 500-client deployments.
+	maxClients      = 600 // hard cap; 503 above this
+	maxWatchesPerAdmin = 20 // max simultaneous watched clients per admin session
+
+	// Idle clients send stream_stats less frequently to reduce relay chatter.
+	// Watched clients keep the 500ms cadence for smooth FPS display.
+	idleStatsTick = 5 * time.Second
 )
 
 // ─── Shared types ─────────────────────────────────────────────────────────────
@@ -164,6 +172,17 @@ func (c *clientConn) writePump() {
 			}
 		}
 	}
+}
+
+// sendStreamDemand pushes {"type":"stream_demand","level":"live"|"idle"} to the
+// client.  Non-blocking: uses the same drop-oldest queue as all other control
+// messages.  Must be called WITHOUT h.mu held (I/O enqueued after unlock).
+func (c *clientConn) sendStreamDemand(level string) {
+	msg, _ := json.Marshal(map[string]string{
+		"type":  "stream_demand",
+		"level": level,
+	})
+	c.enqueueText(msg)
 }
 
 // enqueueText copies payload; drops oldest message if queue is full.
@@ -504,6 +523,7 @@ func newHub() *hub {
 func (h *hub) startBackgroundTasks() {
 	go h.streamStatsLoop()
 	go h.adminAppPingLoop()
+	go h.demandReconcileLoop()
 }
 
 func (h *hub) streamStatsLoop() {
@@ -517,6 +537,55 @@ func (h *hub) streamStatsLoop() {
 			h.publishStreamStats()
 		}
 	}
+}
+
+// demandReconcileLoop re-asserts stream_demand every 10s for every connected
+// client.  This self-corrects any demand signal that was lost due to a
+// dropped message or a race during reconnect.
+func (h *hub) demandReconcileLoop() {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-h.bgDone:
+			return
+		case <-ticker.C:
+			h.reconcileDemand()
+		}
+	}
+}
+
+func (h *hub) reconcileDemand() {
+	type entry struct {
+		c     *clientConn
+		level string
+	}
+	h.mu.RLock()
+	work := make([]entry, 0, len(h.clients))
+	for id, c := range h.clients {
+		level := "idle"
+		if watchers := h.watchIndex[id]; len(watchers) > 0 {
+			level = "live"
+		}
+		work = append(work, entry{c, level})
+	}
+	h.mu.RUnlock()
+
+	for _, e := range work {
+		e.c.sendStreamDemand(e.level)
+	}
+	h.updateDemandMetrics()
+}
+
+func (h *hub) updateDemandMetrics() {
+	h.mu.RLock()
+	liveStreams := len(h.watchIndex)
+	nClients := len(h.clients)
+	nAdmins := len(h.admins)
+	h.mu.RUnlock()
+	observability.SetClientsConnected(int64(nClients))
+	observability.SetAdminsConnected(int64(nAdmins))
+	observability.SetLiveStreams(int64(liveStreams))
 }
 
 func (h *hub) publishStreamStats() {
@@ -616,10 +685,20 @@ func (h *hub) registerClient(c *clientConn) {
 		old.close()
 	}
 	h.clients[c.info.ID] = c
+	// Determine initial demand: live if any admin is already watching this client
+	// (e.g. admin was watching before agent reconnected).
+	initialDemand := "idle"
+	if watchers := h.watchIndex[c.info.ID]; len(watchers) > 0 {
+		initialDemand = "live"
+	}
 	h.mu.Unlock()
-	log.Printf("[+] client %-36s  %s@%s  %dx%d@%dfps",
+
+	// Send demand immediately so client knows its streaming mode from the start.
+	c.sendStreamDemand(initialDemand)
+
+	log.Printf("[+] client %-36s  %s@%s  %dx%d@%dfps  demand=%s",
 		c.info.ID, c.info.Username, c.info.Hostname,
-		c.info.Width, c.info.Height, c.info.FPS)
+		c.info.Width, c.info.Height, c.info.FPS, initialDemand)
 
 	infoJSON, _ := json.Marshal(c.info)
 	meta := registry.ClientMeta{InfoJSON: infoJSON}
@@ -716,6 +795,7 @@ func (h *hub) sendPresenceSnapshot(a *adminConn) {
 func (h *hub) unregisterAdmin(id string) {
 	h.mu.Lock()
 	a, ok := h.admins[id]
+	nowIdle := make([]*clientConn, 0)
 	if ok {
 		a.watchingMu.Lock()
 		for clientID := range a.watching {
@@ -723,6 +803,9 @@ func (h *hub) unregisterAdmin(id string) {
 				delete(m, id)
 				if len(m) == 0 {
 					delete(h.watchIndex, clientID)
+					if c := h.clients[clientID]; c != nil {
+						nowIdle = append(nowIdle, c)
+					}
 				}
 			}
 		}
@@ -737,6 +820,10 @@ func (h *hub) unregisterAdmin(id string) {
 		a.close()
 	}
 	log.Printf("[-] admin  %s", id)
+
+	for _, c := range nowIdle {
+		c.sendStreamDemand("idle")
+	}
 }
 
 func (h *hub) addAdminWatch(a *adminConn, clientID string) {
@@ -744,17 +831,36 @@ func (h *hub) addAdminWatch(a *adminConn, clientID string) {
 		return
 	}
 	h.mu.Lock()
-	defer h.mu.Unlock()
 
 	a.watchingMu.Lock()
+	if len(a.watching) >= maxWatchesPerAdmin {
+		a.watchingMu.Unlock()
+		h.mu.Unlock()
+		log.Printf("[watch] admin %s hit max-watches cap (%d), ignoring watch for %s",
+			a.id, maxWatchesPerAdmin, clientID)
+		return
+	}
 	a.watching[clientID] = struct{}{}
 	a.watchingMu.Unlock()
 
 	if h.watchIndex[clientID] == nil {
 		h.watchIndex[clientID] = make(map[string]*adminConn)
 	}
+	wasEmpty := len(h.watchIndex[clientID]) == 0
 	h.watchIndex[clientID][a.id] = a
 	h.reg.AddWatch(a.id, clientID)
+
+	// Collect the client pointer while still under the lock so we can
+	// send the demand signal without holding the lock (I/O outside lock).
+	var target *clientConn
+	if wasEmpty {
+		target = h.clients[clientID]
+	}
+	h.mu.Unlock()
+
+	if target != nil {
+		target.sendStreamDemand("live")
+	}
 }
 
 func (h *hub) removeAdminWatch(a *adminConn, clientID string) {
@@ -762,32 +868,42 @@ func (h *hub) removeAdminWatch(a *adminConn, clientID string) {
 		return
 	}
 	h.mu.Lock()
-	defer h.mu.Unlock()
 
 	a.watchingMu.Lock()
 	delete(a.watching, clientID)
 	a.watchingMu.Unlock()
 	a.removeClientFrames(clientID)
 
+	var target *clientConn
 	if m, ok := h.watchIndex[clientID]; ok {
 		delete(m, a.id)
 		if len(m) == 0 {
 			delete(h.watchIndex, clientID)
+			target = h.clients[clientID]
 		}
 	}
 	h.reg.RemoveWatch(a.id, clientID)
+	h.mu.Unlock()
+
+	if target != nil {
+		target.sendStreamDemand("idle")
+	}
 }
 
 func (h *hub) clearAdminWatch(a *adminConn) {
 	h.mu.Lock()
-	defer h.mu.Unlock()
 
+	// Collect client pointers for demand notifications before modifying state.
+	nowIdle := make([]*clientConn, 0)
 	a.watchingMu.Lock()
 	for clientID := range a.watching {
 		if m, ok := h.watchIndex[clientID]; ok {
 			delete(m, a.id)
 			if len(m) == 0 {
 				delete(h.watchIndex, clientID)
+				if c := h.clients[clientID]; c != nil {
+					nowIdle = append(nowIdle, c)
+				}
 			}
 		}
 		a.removeClientFrames(clientID)
@@ -795,6 +911,11 @@ func (h *hub) clearAdminWatch(a *adminConn) {
 	a.watching = make(map[string]struct{})
 	a.watchingMu.Unlock()
 	h.reg.ClearWatch(a.id)
+	h.mu.Unlock()
+
+	for _, c := range nowIdle {
+		c.sendStreamDemand("idle")
+	}
 }
 
 // routeFrame delivers a JPEG frame from clientID to every watching admin.
@@ -1208,6 +1329,11 @@ func (h *hub) handleClientWS(w http.ResponseWriter, r *http.Request) {
 	}()
 	if h.shuttingDown.Load() {
 		http.Error(w, "server shutting down", http.StatusServiceUnavailable)
+		return
+	}
+	// Enforce hard cap to protect relay at 500-client scale.
+	if h.activeConns.Load() >= maxClients {
+		http.Error(w, "relay at capacity", http.StatusServiceUnavailable)
 		return
 	}
 	ip := clientIP(r)
@@ -1668,11 +1794,15 @@ func (h *hub) handleHealth(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (h *hub) handleAPIStatus(w http.ResponseWriter, _ *http.Request) {
+	h.mu.RLock()
+	liveStreams := len(h.watchIndex)
+	h.mu.RUnlock()
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"connected_clients": h.reg.ClientCount(),
 		"connected_admins":  h.reg.AdminCount(),
 		"grace_clients":     h.reg.GraceCount(),
+		"live_streams":      liveStreams,
 		"server_uptime_s":   int(h.reg.Uptime().Seconds()),
 		"relay_ok":          h.relayReady.Load() && !h.shuttingDown.Load(),
 	})
