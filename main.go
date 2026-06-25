@@ -29,6 +29,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -1030,6 +1031,10 @@ func (h *hub) buildClientListJSONLocked() []byte {
 	for _, c := range h.clients {
 		list = append(list, c.info)
 	}
+	// Sort oldest-connected first so the client list never reorders in the admin UI.
+	sort.Slice(list, func(i, j int) bool {
+		return list[i].ConnectedAt.Before(list[j].ConnectedAt)
+	})
 	msg := map[string]any{"type": "client_list", "clients": list}
 	data, _ := json.Marshal(msg)
 	return data
