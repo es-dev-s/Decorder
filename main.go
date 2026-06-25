@@ -493,6 +493,10 @@ type hub struct {
 	shuttingDown atomic.Bool
 	relayReady   atomic.Bool
 	frameSample  atomic.Uint64
+
+	// Latest resource-health JSON per client (clientID → []byte), for instant
+	// dashboard display when an admin connects.
+	healthCache sync.Map
 }
 
 func newHub() *hub {
@@ -745,6 +749,7 @@ func (h *hub) unregisterClient(id string, c *clientConn) {
 	}
 	h.reg.UnregisterClient(id, meta)
 	h.streamStats.Remove(id)
+	h.healthCache.Delete(id)
 	h.syncMetricGauges()
 
 	durationS := int(time.Since(c.connectedAt).Seconds())
@@ -771,6 +776,18 @@ func (h *hub) registerAdmin(a *adminConn) {
 	h.sendPresenceSnapshot(a)
 	h.sendScreenshotSnapshot(a)
 	h.sendAgentPolicySnapshot(a)
+	h.sendHealthSnapshot(a)
+}
+
+// sendHealthSnapshot pushes the last-known resource health for every client so a
+// freshly-connected admin sees CPU/GPU/RAM immediately instead of waiting ~3s.
+func (h *hub) sendHealthSnapshot(a *adminConn) {
+	h.healthCache.Range(func(_, v any) bool {
+		if raw, ok := v.([]byte); ok {
+			a.enqueueText(raw)
+		}
+		return true
+	})
 }
 
 func (h *hub) sendPresenceSnapshot(a *adminConn) {
@@ -1545,6 +1562,15 @@ func (h *hub) handleClientWS(w http.ResponseWriter, r *http.Request) {
 					if qF, ok := msg["quality"].(float64); ok && qF > 0 {
 						h.updateClientInfo(info.ID, 0, uint32(qF), 0)
 					}
+				}
+
+			case "health":
+				// Resource telemetry (CPU/GPU/RAM) — broadcast to ALL admins so the
+				// dashboard shows live resource pressure for every device, watched or not.
+				msg["client_id"] = info.ID
+				if raw, err := json.Marshal(msg); err == nil {
+					h.healthCache.Store(info.ID, raw)
+					h.broadcastToAdmins(raw)
 				}
 
 			case "presence_sync", "presence_batch":
