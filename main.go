@@ -267,6 +267,7 @@ type adminConn struct {
 	appPingMu     sync.Mutex
 	pendingPingMs int64
 	pingDeadline  time.Time
+	lastRttMs     int64 // server-measured round-trip (single clock, no skew)
 
 	// End-to-end encryption: this admin's RSA public key (base64 SPKI DER),
 	// sent once after connect. Empty until received.
@@ -312,14 +313,22 @@ func (a *adminConn) close() {
 
 func (a *adminConn) prepareServerPing() []byte {
 	ts := protocol.NowMs()
-	raw, err := protocol.MarshalServerPing(ts)
-	if err != nil {
-		return nil
-	}
 	a.appPingMu.Lock()
 	a.pendingPingMs = ts
 	a.pingDeadline = time.Now().Add(appPingTimeout)
+	rtt := a.lastRttMs
 	a.appPingMu.Unlock()
+	// Include the last server-measured RTT so the admin shows true round-trip
+	// latency instead of (admin_clock - server_clock), which is corrupted by
+	// any clock skew between the operator's PC and the cloud server.
+	raw, err := json.Marshal(map[string]any{
+		"type":   string(protocol.MsgServerPing),
+		"ts":     ts,
+		"rtt_ms": rtt,
+	})
+	if err != nil {
+		return nil
+	}
 	return raw
 }
 
@@ -327,6 +336,10 @@ func (a *adminConn) handleAdminPing(ts int64) {
 	a.appPingMu.Lock()
 	if a.pendingPingMs != 0 && ts == a.pendingPingMs {
 		a.pendingPingMs = 0
+		// Both timestamps are the server clock → true RTT, skew-free.
+		if rtt := protocol.NowMs() - ts; rtt >= 0 {
+			a.lastRttMs = rtt
+		}
 	}
 	a.appPingMu.Unlock()
 }
