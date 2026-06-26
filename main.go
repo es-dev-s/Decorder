@@ -716,11 +716,11 @@ func (h *hub) streamStatsLoop() {
 	}
 }
 
-// demandReconcileLoop re-asserts stream_demand every 10s for every connected
+// demandReconcileLoop re-asserts stream_demand every 2s for every connected
 // client.  This self-corrects any demand signal that was lost due to a
 // dropped message or a race during reconnect.
 func (h *hub) demandReconcileLoop() {
-	ticker := time.NewTicker(5 * time.Second)
+	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 	for {
 		select {
