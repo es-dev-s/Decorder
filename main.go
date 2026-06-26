@@ -54,7 +54,7 @@ const (
 	listDebounce     = 50 * time.Millisecond
 	adminClientIDLen = 36 // UUID string prefix on every binary frame
 
-	appPingInterval      = 1 * time.Second
+	appPingInterval      = 500 * time.Millisecond
 	appPingTimeout       = 4 * time.Second
 	streamStatsTick      = 500 * time.Millisecond
 	maxFrameBurstPerPoke = 12 // interleave pings/text during multi-client frame bursts
@@ -206,13 +206,17 @@ func (h *hub) routeToAdmin(adminID string, data []byte) {
 }
 
 // sendStreamDemand pushes {"type":"stream_demand","level":"live"|"idle"} to the
-// client.  Non-blocking: uses the same drop-oldest queue as all other control
-// messages.  Must be called WITHOUT h.mu held (I/O enqueued after unlock).
-func (c *clientConn) sendStreamDemand(level string) {
-	msg, _ := json.Marshal(map[string]string{
+// client.  boost=true on live tells the agent to flush an instant frame (admin
+// just started watching).  Non-blocking: uses the same drop-oldest queue.
+func (c *clientConn) sendStreamDemand(level string, boost bool) {
+	payload := map[string]any{
 		"type":  "stream_demand",
 		"level": level,
-	})
+	}
+	if boost && level == "live" {
+		payload["boost"] = true
+	}
+	msg, _ := json.Marshal(payload)
 	c.enqueueText(msg)
 }
 
@@ -258,6 +262,11 @@ type adminConn struct {
 	// Reliable outbound channel for text frames (control, stats, presence).
 	textSend chan wsMsg
 
+	// Priority channel for application-level server_ping — must not queue behind
+	// stream_stats / client_list when many agents are connected.
+	pingSend chan []byte
+	pingPoke chan struct{}
+
 	// Per-client latest video frame. Shared byte slice (immutable after build).
 	frameMu      sync.Mutex
 	latestFrames map[string][]byte // clientID → pre-built admin frame (uuid+jpeg)
@@ -298,6 +307,8 @@ func newAdminConn(conn *websocket.Conn) *adminConn {
 		textSend:     make(chan wsMsg, textQueueDepth),
 		latestFrames: make(map[string][]byte),
 		framePoke:    make(chan struct{}, 1),
+		pingSend:     make(chan []byte, 1),
+		pingPoke:     make(chan struct{}, 1),
 	}
 	go a.writePump()
 	return a
@@ -372,6 +383,23 @@ func (a *adminConn) writePump() {
 			_ = a.conn.SetWriteDeadline(time.Now().Add(writeWait))
 			if err := a.conn.WriteMessage(msg.mt, msg.data); err != nil {
 				return
+			}
+
+		case <-a.pingPoke:
+			for {
+				var data []byte
+				select {
+				case data = <-a.pingSend:
+				default:
+					data = nil
+				}
+				if data == nil {
+					break
+				}
+				_ = a.conn.SetWriteDeadline(time.Now().Add(writeWait))
+				if err := a.conn.WriteMessage(websocket.TextMessage, data); err != nil {
+					return
+				}
 			}
 
 		case <-a.framePoke:
@@ -454,6 +482,28 @@ func (a *adminConn) watchedClients() []string {
 		out = append(out, id)
 	}
 	return out
+}
+
+// enqueueServerPing delivers server_ping on a priority lane so RTT stays accurate
+// even when the text queue is full of stream_stats from hundreds of clients.
+func (a *adminConn) enqueueServerPing(data []byte) {
+	payload := append([]byte(nil), data...)
+	select {
+	case a.pingSend <- payload:
+	default:
+		select {
+		case <-a.pingSend:
+		default:
+		}
+		select {
+		case a.pingSend <- payload:
+		default:
+		}
+	}
+	select {
+	case a.pingPoke <- struct{}{}:
+	default:
+	}
 }
 
 // enqueueText copies data and sends to the text channel; drops oldest on pressure.
@@ -637,7 +687,7 @@ func (h *hub) reconcileDemand() {
 	h.mu.RUnlock()
 
 	for _, e := range work {
-		e.c.sendStreamDemand(e.level)
+		e.c.sendStreamDemand(e.level, false)
 	}
 	h.updateDemandMetrics()
 }
@@ -704,7 +754,7 @@ func (h *hub) sendAdminServerPings() {
 
 	for _, a := range admins {
 		if raw := a.prepareServerPing(); len(raw) > 0 {
-			a.enqueueText(raw)
+			a.enqueueServerPing(raw)
 		}
 	}
 }
@@ -768,7 +818,7 @@ func (h *hub) registerClient(c *clientConn) {
 	h.mu.Unlock()
 
 	// Send demand immediately so client knows its streaming mode from the start.
-	c.sendStreamDemand(initialDemand)
+	c.sendStreamDemand(initialDemand, initialDemand == "live")
 	// Re-establish E2E key wrapping for any admins already watching.
 	for _, w := range e2eWatchers {
 		c.sendE2EWatcher(w.id, w.pubkey)
@@ -920,7 +970,7 @@ func (h *hub) unregisterAdmin(id string) {
 	log.Printf("[-] admin  %s", id)
 
 	for _, c := range nowIdle {
-		c.sendStreamDemand("idle")
+		c.sendStreamDemand("idle", false)
 	}
 	for _, c := range e2eDrop {
 		c.sendE2EUnwatch(id)
@@ -967,7 +1017,7 @@ func (h *hub) addAdminWatch(a *adminConn, clientID string) {
 	h.mu.Unlock()
 
 	if target != nil {
-		target.sendStreamDemand("live")
+		target.sendStreamDemand("live", true)
 	}
 	if e2eTarget != nil && adminPubkey != "" {
 		e2eTarget.sendE2EWatcher(a.id, adminPubkey)
@@ -1003,7 +1053,7 @@ func (h *hub) removeAdminWatch(a *adminConn, clientID string) {
 	h.mu.Unlock()
 
 	if target != nil {
-		target.sendStreamDemand("idle")
+		target.sendStreamDemand("idle", false)
 	}
 	if e2eTarget != nil {
 		e2eTarget.sendE2EUnwatch(a.id)
@@ -1041,7 +1091,7 @@ func (h *hub) clearAdminWatch(a *adminConn) {
 	h.mu.Unlock()
 
 	for _, c := range nowIdle {
-		c.sendStreamDemand("idle")
+		c.sendStreamDemand("idle", false)
 	}
 	for _, c := range e2eDrop {
 		c.sendE2EUnwatch(a.id)
