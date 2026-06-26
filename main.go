@@ -57,7 +57,7 @@ const (
 	appPingInterval      = 500 * time.Millisecond
 	appPingTimeout       = 4 * time.Second
 	streamStatsTick      = 500 * time.Millisecond
-	maxFrameBurstPerPoke = 12 // interleave pings/text during multi-client frame bursts
+	maxFrameBurstPerPoke = maxWatchesPerAdmin // drain all pending latest frames per wake
 
 	// Scale limits for 500-client deployments.
 	maxClients      = 600 // hard cap; 503 above this
@@ -66,6 +66,9 @@ const (
 	// Idle clients send stream_stats less frequently to reduce relay chatter.
 	// Watched clients keep the 500ms cadence for smooth FPS display.
 	idleStatsTick = 5 * time.Second
+
+	// Min spacing between backpressure control messages to a client (adaptive.rs).
+	pressureNotifyMinInterval = 200 * time.Millisecond
 )
 
 // ─── Shared types ─────────────────────────────────────────────────────────────
@@ -268,9 +271,10 @@ type adminConn struct {
 	pingPoke chan struct{}
 
 	// Per-client latest video frame. Shared byte slice (immutable after build).
-	frameMu      sync.Mutex
-	latestFrames map[string][]byte // clientID → pre-built admin frame (uuid+jpeg)
-	framePoke    chan struct{}     // capacity 1; wakes write pump
+	frameMu            sync.Mutex
+	latestFrames       map[string][]byte // clientID → pre-built admin frame (uuid+jpeg)
+	displacementStreak map[string]int    // consecutive latest-frame replacements per client
+	framePoke          chan struct{}     // capacity 1; wakes write pump
 
 	// Application-level ping (separate from WebSocket protocol ping).
 	appPingMu     sync.Mutex
@@ -304,9 +308,10 @@ func newAdminConn(conn *websocket.Conn) *adminConn {
 		done:         make(chan struct{}),
 		hb:           heartbeat.NewMonitor("admin=" + id),
 		watching:     make(map[string]struct{}),
-		textSend:     make(chan wsMsg, textQueueDepth),
-		latestFrames: make(map[string][]byte),
-		framePoke:    make(chan struct{}, 1),
+		textSend:           make(chan wsMsg, textQueueDepth),
+		latestFrames:       make(map[string][]byte),
+		displacementStreak: make(map[string]int),
+		framePoke:          make(chan struct{}, 1),
 		pingSend:     make(chan []byte, 1),
 		pingPoke:     make(chan struct{}, 1),
 	}
@@ -403,9 +408,9 @@ func (a *adminConn) writePump() {
 			}
 
 		case <-a.framePoke:
-			// Drain up to maxFrameBurstPerPoke frames, yielding to text/ping between
-			// bursts so multi-client streaming cannot stall admin heartbeats.
-		frameBurst:
+			// Drain every latest frame (at most maxWatchesPerAdmin entries). Each slot
+			// is already latest-only per client — send them all so multi-watch admins
+			// don't fall seconds behind while the write pump yields to text/ping.
 			for burst := 0; burst < maxFrameBurstPerPoke; burst++ {
 				a.frameMu.Lock()
 				if len(a.latestFrames) == 0 {
@@ -413,10 +418,15 @@ func (a *adminConn) writePump() {
 					break
 				}
 				var frame []byte
+				var sentClientID string
 				for cid, f := range a.latestFrames {
 					frame = f
+					sentClientID = cid
 					delete(a.latestFrames, cid)
 					break
+				}
+				if sentClientID != "" {
+					delete(a.displacementStreak, sentClientID)
 				}
 				more := len(a.latestFrames) > 0
 				a.frameMu.Unlock()
@@ -428,28 +438,37 @@ func (a *adminConn) writePump() {
 				if !more {
 					break
 				}
-
-				select {
-				case <-a.done:
-					return
-				case msg, ok := <-a.textSend:
-					if !ok {
+				// Yield to urgent text/ping every 4 frames so heartbeats stay fresh.
+				if burst > 0 && burst%4 == 3 {
+					select {
+					case <-a.done:
 						return
+					case msg, ok := <-a.textSend:
+						if !ok {
+							return
+						}
+						_ = a.conn.SetWriteDeadline(time.Now().Add(writeWait))
+						if err := a.conn.WriteMessage(msg.mt, msg.data); err != nil {
+							return
+						}
+					case <-a.pingPoke:
+						for {
+							var data []byte
+							select {
+							case data = <-a.pingSend:
+							default:
+								data = nil
+							}
+							if data == nil {
+								break
+							}
+							_ = a.conn.SetWriteDeadline(time.Now().Add(writeWait))
+							if err := a.conn.WriteMessage(websocket.TextMessage, data); err != nil {
+								return
+							}
+						}
+					default:
 					}
-					_ = a.conn.SetWriteDeadline(time.Now().Add(writeWait))
-					if err := a.conn.WriteMessage(msg.mt, msg.data); err != nil {
-						return
-					}
-					break frameBurst
-				case <-ticker.C:
-					if a.hb.OnPingSent() {
-						return
-					}
-					_ = a.conn.SetWriteDeadline(time.Now().Add(writeWait))
-					if err := a.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
-						return
-					}
-				default:
 				}
 			}
 			a.frameMu.Lock()
@@ -542,13 +561,33 @@ func (a *adminConn) enqueuePresence(data []byte) {
 	}
 }
 
+// displacementDropWeight maps consecutive slot replacements to a backpressure weight.
+func displacementDropWeight(streak int) uint64 {
+	switch {
+	case streak >= 10:
+		return 10
+	case streak >= 5:
+		return 7
+	case streak >= 3:
+		return 4
+	default:
+		return 1
+	}
+}
+
 // enqueueFrame stores the latest frame for clientID and wakes the write pump.
 // data MUST be an immutable byte slice (caller must not modify it afterwards).
-// Returns true if a previous pending frame was replaced (i.e. the old frame
-// will not be sent — used for backpressure accounting).
-func (a *adminConn) enqueueFrame(clientID string, data []byte) (replaced bool) {
+// Returns whether a previous pending frame was replaced and the drop weight for
+// backpressure accounting (0 when the slot was empty / prior frame was delivered).
+func (a *adminConn) enqueueFrame(clientID string, data []byte) (replaced bool, dropWeight uint64) {
 	a.frameMu.Lock()
 	_, replaced = a.latestFrames[clientID]
+	if replaced {
+		a.displacementStreak[clientID]++
+		dropWeight = displacementDropWeight(a.displacementStreak[clientID])
+	} else {
+		a.displacementStreak[clientID] = 0
+	}
 	a.latestFrames[clientID] = data
 	a.frameMu.Unlock()
 
@@ -557,7 +596,7 @@ func (a *adminConn) enqueueFrame(clientID string, data []byte) (replaced bool) {
 	default:
 		// Write pump is already awake; it will drain the new frame on its next pass.
 	}
-	return replaced
+	return replaced, dropWeight
 }
 
 // removeClientFrames purges all pending frames for clientID when the client
@@ -565,6 +604,7 @@ func (a *adminConn) enqueueFrame(clientID string, data []byte) (replaced bool) {
 func (a *adminConn) removeClientFrames(clientID string) {
 	a.frameMu.Lock()
 	delete(a.latestFrames, clientID)
+	delete(a.displacementStreak, clientID)
 	a.frameMu.Unlock()
 }
 
@@ -1127,11 +1167,24 @@ func (h *hub) routeFrame(clientID string, data []byte) {
 		)
 	}
 
+	var delivered, dropped uint64
 	for _, a := range targets {
-		a.enqueueFrame(clientID, frame)
+		repl, dw := a.enqueueFrame(clientID, frame)
+		if repl {
+			if dw > dropped {
+				dropped = dw
+			}
+		} else {
+			delivered++
+		}
 	}
-	// Latest-frame routing intentionally replaces pending frames — that is not
-	// client backpressure. Adaptive/stream quality uses client-side send metrics.
+
+	h.mu.RLock()
+	client := h.clients[clientID]
+	h.mu.RUnlock()
+	if client != nil && (delivered > 0 || dropped > 0) {
+		client.noteRoutePressure(delivered, dropped)
+	}
 }
 
 func (c *clientConn) noteRoutePressure(delivered, dropped uint64) {
@@ -1139,7 +1192,7 @@ func (c *clientConn) noteRoutePressure(delivered, dropped uint64) {
 	c.pressureRouted += delivered
 	c.pressureDropped += dropped
 	now := time.Now()
-	if now.Sub(c.lastPressureSent) < 2*time.Second {
+	if now.Sub(c.lastPressureSent) < pressureNotifyMinInterval {
 		c.pressureMu.Unlock()
 		return
 	}

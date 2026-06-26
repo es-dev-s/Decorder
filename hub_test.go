@@ -9,12 +9,13 @@ import (
 
 func mockAdmin(id string) *adminConn {
 	return &adminConn{
-		id:           id,
-		textSend:     make(chan wsMsg, textQueueDepth),
-		done:         make(chan struct{}),
-		watching:     make(map[string]struct{}),
-		latestFrames: make(map[string][]byte),
-		framePoke:    make(chan struct{}, 1),
+		id:                 id,
+		textSend:           make(chan wsMsg, textQueueDepth),
+		done:               make(chan struct{}),
+		watching:           make(map[string]struct{}),
+		latestFrames:       make(map[string][]byte),
+		displacementStreak: make(map[string]int),
+		framePoke:          make(chan struct{}, 1),
 	}
 }
 
@@ -331,6 +332,43 @@ func TestClientListJSONValid(t *testing.T) {
 	}
 	if msg["type"] != "client_list" {
 		t.Fatalf("type = %v", msg["type"])
+	}
+}
+
+// ─── Route backpressure ───────────────────────────────────────────────────────
+
+func TestRouteFrameBackpressureOnDisplacement(t *testing.T) {
+	h := newHub()
+	clientID := "client-bp"
+	c := &clientConn{
+		info: ClientInfo{ID: clientID, ConnectedAt: time.Now()},
+		send: make(chan wsMsg, 32),
+		done: make(chan struct{}),
+	}
+	h.registerClient(c)
+	a := mockAdmin("admin-1")
+	h.mu.Lock()
+	h.admins[a.id] = a
+	h.mu.Unlock()
+	h.addAdminWatch(a, clientID)
+
+	// Without a write pump, each routeFrame replaces the pending slot.
+	for i := 0; i < 6; i++ {
+		h.routeFrame(clientID, []byte{byte(i)})
+	}
+
+	c.pressureMu.Lock()
+	got := c.pressureDropped
+	c.pressureMu.Unlock()
+	if got == 0 {
+		t.Fatalf("expected pressureDropped > 0 after consecutive displacements, got %d", got)
+	}
+
+	a.frameMu.Lock()
+	streak := a.displacementStreak[clientID]
+	a.frameMu.Unlock()
+	if streak < 3 {
+		t.Fatalf("displacement streak = %d, want >= 3", streak)
 	}
 }
 
