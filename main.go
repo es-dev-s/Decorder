@@ -1059,7 +1059,6 @@ func (h *hub) addAdminWatch(a *adminConn, clientID string) {
 	if h.watchIndex[clientID] == nil {
 		h.watchIndex[clientID] = make(map[string]*adminConn)
 	}
-	wasEmpty := len(h.watchIndex[clientID]) == 0
 	h.watchIndex[clientID][a.id] = a
 	h.reg.AddWatch(a.id, clientID)
 
@@ -1077,7 +1076,7 @@ func (h *hub) addAdminWatch(a *adminConn, clientID string) {
 
 	if target != nil {
 		// Re-assert live on every watch (handles reconnect / dropped demand).
-		target.sendStreamDemand("live", wasEmpty)
+		target.sendStreamDemand("live", true)
 	}
 	if e2eTarget != nil && adminPubkey != "" {
 		e2eTarget.sendE2EWatcher(a.id, adminPubkey)
