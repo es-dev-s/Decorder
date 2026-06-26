@@ -210,7 +210,7 @@ func (h *hub) routeToAdmin(adminID string, data []byte) {
 
 // sendStreamDemand pushes {"type":"stream_demand","level":"live"|"idle"} to the
 // client.  boost=true on live tells the agent to flush an instant frame (admin
-// just started watching).  Non-blocking: uses the same drop-oldest queue.
+// just started watching).  Uses reliable enqueue — must not be dropped.
 func (c *clientConn) sendStreamDemand(level string, boost bool) {
 	payload := map[string]any{
 		"type":  "stream_demand",
@@ -220,7 +220,7 @@ func (c *clientConn) sendStreamDemand(level string, boost bool) {
 		payload["boost"] = true
 	}
 	msg, _ := json.Marshal(payload)
-	c.enqueueText(msg)
+	c.enqueueTextReliable(msg)
 }
 
 // enqueueText copies payload; drops oldest message if queue is full.
@@ -238,6 +238,28 @@ func (c *clientConn) enqueueText(data []byte) {
 	select {
 	case c.send <- wsMsg{mt: websocket.TextMessage, data: payload}:
 	default:
+	}
+}
+
+// enqueueTextReliable delivers control that must reach the agent (stream_demand).
+// Evicts older queued text before giving up so live mode is not stuck at ~1 fps.
+func (c *clientConn) enqueueTextReliable(data []byte) {
+	payload := append([]byte(nil), data...)
+	for attempt := 0; attempt < 64; attempt++ {
+		select {
+		case c.send <- wsMsg{mt: websocket.TextMessage, data: payload}:
+			return
+		default:
+			select {
+			case <-c.send:
+			default:
+			}
+		}
+	}
+	select {
+	case c.send <- wsMsg{mt: websocket.TextMessage, data: payload}:
+	case <-time.After(2 * time.Second):
+		log.Printf("[warn] stream_demand not queued for client %s (send channel full)", c.info.ID)
 	}
 }
 
@@ -698,7 +720,7 @@ func (h *hub) streamStatsLoop() {
 // client.  This self-corrects any demand signal that was lost due to a
 // dropped message or a race during reconnect.
 func (h *hub) demandReconcileLoop() {
-	ticker := time.NewTicker(10 * time.Second)
+	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 	for {
 		select {
@@ -1043,10 +1065,7 @@ func (h *hub) addAdminWatch(a *adminConn, clientID string) {
 
 	// Collect the client pointer while still under the lock so we can
 	// send the demand signal without holding the lock (I/O outside lock).
-	var target *clientConn
-	if wasEmpty {
-		target = h.clients[clientID]
-	}
+	target := h.clients[clientID]
 	// For E2E, the client always needs THIS admin's public key (even if other
 	// admins were already watching) so it can wrap the session key for it.
 	var e2eTarget *clientConn
@@ -1057,7 +1076,8 @@ func (h *hub) addAdminWatch(a *adminConn, clientID string) {
 	h.mu.Unlock()
 
 	if target != nil {
-		target.sendStreamDemand("live", true)
+		// Re-assert live on every watch (handles reconnect / dropped demand).
+		target.sendStreamDemand("live", wasEmpty)
 	}
 	if e2eTarget != nil && adminPubkey != "" {
 		e2eTarget.sendE2EWatcher(a.id, adminPubkey)
@@ -1171,7 +1191,9 @@ func (h *hub) routeFrame(clientID string, data []byte) {
 	for _, a := range targets {
 		repl, dw := a.enqueueFrame(clientID, frame)
 		if repl {
-			if dw > dropped {
+			// Latest-only slot churn at 30fps is normal; only signal congestion once
+			// frames pile up without being sent (streak ≥ 3 → dropWeight ≥ 4).
+			if dw >= 4 && dw > dropped {
 				dropped = dw
 			}
 		} else {
@@ -1265,7 +1287,7 @@ func (h *hub) sendControlToClient(clientID string, msg []byte) {
 	c, ok := h.clients[clientID]
 	h.mu.RUnlock()
 	if ok {
-		c.enqueueText(msg)
+		c.enqueueTextReliable(msg)
 	} else {
 		log.Printf("    control: client %s not found", clientID)
 	}
