@@ -16,6 +16,8 @@ const (
 	adminFrameHeaderLen  = 28
 	frameVersionPlain    = 0x01
 	frameVersionEnc      = 0x02
+	frameVersionH264D    = 0x03 // H.264 delta (inter) frame
+	frameVersionH264K    = 0x04 // H.264 keyframe (IDR)
 	hkdfInfo             = "decoder-client-v1-stream-key"
 )
 
@@ -46,14 +48,15 @@ func normalizeClientFrame(data []byte) ([]byte, error) {
 	}
 
 	version := data[0]
-	if version != frameVersionPlain && version != frameVersionEnc {
+	if version != frameVersionPlain && version != frameVersionEnc &&
+		version != frameVersionH264D && version != frameVersionH264K {
 		return data, nil
 	}
 
-	// End-to-end encrypted frames are relayed VERBATIM. The relay never holds the
-	// session key and must never attempt to decrypt — it forwards the full
-	// client-v1 frame (header + nonce + ciphertext) so only the admin can decrypt.
-	if version == frameVersionEnc {
+	// Encrypted (0x02) and H.264 (0x03/0x04) frames are relayed VERBATIM. The
+	// relay never holds the session key and never transcodes — it forwards the
+	// full client-v1 frame so only the admin decodes/decrypts.
+	if version == frameVersionEnc || version == frameVersionH264D || version == frameVersionH264K {
 		return data, nil
 	}
 
