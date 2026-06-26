@@ -352,8 +352,12 @@ func (a *adminConn) close() {
 func (a *adminConn) prepareServerPing() []byte {
 	ts := protocol.NowMs()
 	a.appPingMu.Lock()
-	a.pendingPingMs = ts
-	a.pingDeadline = time.Now().Add(appPingTimeout)
+	if a.pendingPingMs == 0 {
+		a.pendingPingMs = ts
+		a.pingDeadline = time.Now().Add(appPingTimeout)
+	} else {
+		ts = a.pendingPingMs
+	}
 	rtt := a.lastRttMs
 	a.appPingMu.Unlock()
 	// Include the last server-measured RTT so the admin shows true round-trip
@@ -460,8 +464,8 @@ func (a *adminConn) writePump() {
 				if !more {
 					break
 				}
-				// Yield to urgent text/ping every 4 frames so heartbeats stay fresh.
-				if burst > 0 && burst%4 == 3 {
+				// Yield to urgent text/ping after every frame so heartbeats stay fresh.
+				{
 					select {
 					case <-a.done:
 						return
@@ -720,7 +724,7 @@ func (h *hub) streamStatsLoop() {
 // client.  This self-corrects any demand signal that was lost due to a
 // dropped message or a race during reconnect.
 func (h *hub) demandReconcileLoop() {
-	ticker := time.NewTicker(2 * time.Second)
+	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 	for {
 		select {
@@ -1186,25 +1190,10 @@ func (h *hub) routeFrame(clientID string, data []byte) {
 		)
 	}
 
-	var delivered, dropped uint64
+	// Latest-only slot replacement is intentional coalescing — not congestion.
+	// Backpressure from displacement caused false throttling (~1–4 fps).
 	for _, a := range targets {
-		repl, dw := a.enqueueFrame(clientID, frame)
-		if repl {
-			// Latest-only slot churn at 30fps is normal; only signal congestion once
-			// frames pile up without being sent (streak ≥ 3 → dropWeight ≥ 4).
-			if dw >= 4 && dw > dropped {
-				dropped = dw
-			}
-		} else {
-			delivered++
-		}
-	}
-
-	h.mu.RLock()
-	client := h.clients[clientID]
-	h.mu.RUnlock()
-	if client != nil && (delivered > 0 || dropped > 0) {
-		client.noteRoutePressure(delivered, dropped)
+		a.enqueueFrame(clientID, frame)
 	}
 }
 

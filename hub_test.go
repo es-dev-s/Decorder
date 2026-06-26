@@ -337,7 +337,7 @@ func TestClientListJSONValid(t *testing.T) {
 
 // ─── Route backpressure ───────────────────────────────────────────────────────
 
-func TestRouteFrameBackpressureOnDisplacement(t *testing.T) {
+func TestRouteFrameNoBackpressureOnDisplacement(t *testing.T) {
 	h := newHub()
 	clientID := "client-bp"
 	c := &clientConn{
@@ -352,7 +352,8 @@ func TestRouteFrameBackpressureOnDisplacement(t *testing.T) {
 	h.mu.Unlock()
 	h.addAdminWatch(a, clientID)
 
-	// Without a write pump, each routeFrame replaces the pending slot.
+	// Without a write pump, each routeFrame replaces the pending slot — that is
+	// normal latest-only coalescing, not congestion.
 	for i := 0; i < 6; i++ {
 		h.routeFrame(clientID, []byte{byte(i)})
 	}
@@ -360,8 +361,8 @@ func TestRouteFrameBackpressureOnDisplacement(t *testing.T) {
 	c.pressureMu.Lock()
 	got := c.pressureDropped
 	c.pressureMu.Unlock()
-	if got == 0 {
-		t.Fatalf("expected pressureDropped > 0 after consecutive displacements, got %d", got)
+	if got != 0 {
+		t.Fatalf("expected no backpressure from slot displacement, got pressureDropped=%d", got)
 	}
 
 	a.frameMu.Lock()
