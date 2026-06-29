@@ -56,6 +56,8 @@ const (
 
 	appPingInterval      = 500 * time.Millisecond
 	appPingTimeout       = 4 * time.Second
+	appPingTimeoutLive   = 12 * time.Second // extended while admin is actively watching
+	demandReconcileTick  = 5 * time.Second
 	streamStatsTick      = 500 * time.Millisecond
 	maxFrameBurstPerPoke = maxWatchesPerAdmin // drain all pending latest frames per wake
 
@@ -127,6 +129,9 @@ type clientConn struct {
 	// Phase 2.2: per-session replay guard.
 	replayMu sync.Mutex
 	replay   *ReplayGuard
+
+	demandMu    sync.Mutex
+	demandLevel string // last sent "live" | "idle" — skip redundant reconcile
 }
 
 func newClientConn(info ClientInfo, conn *websocket.Conn) *clientConn {
@@ -212,6 +217,14 @@ func (h *hub) routeToAdmin(adminID string, data []byte) {
 // client.  boost=true on live tells the agent to flush an instant frame (admin
 // just started watching).  Uses reliable enqueue — must not be dropped.
 func (c *clientConn) sendStreamDemand(level string, boost bool) {
+	c.demandMu.Lock()
+	if !boost && c.demandLevel == level {
+		c.demandMu.Unlock()
+		return
+	}
+	c.demandLevel = level
+	c.demandMu.Unlock()
+
 	payload := map[string]any{
 		"type":  "stream_demand",
 		"level": level,
@@ -349,12 +362,22 @@ func (a *adminConn) close() {
 	}
 }
 
+func (a *adminConn) appPingTimeoutFor() time.Duration {
+	a.watchingMu.RLock()
+	n := len(a.watching)
+	a.watchingMu.RUnlock()
+	if n > 0 {
+		return appPingTimeoutLive
+	}
+	return appPingTimeout
+}
+
 func (a *adminConn) prepareServerPing() []byte {
 	ts := protocol.NowMs()
 	a.appPingMu.Lock()
 	if a.pendingPingMs == 0 {
 		a.pendingPingMs = ts
-		a.pingDeadline = time.Now().Add(appPingTimeout)
+		a.pingDeadline = time.Now().Add(a.appPingTimeoutFor())
 	} else {
 		ts = a.pendingPingMs
 	}
@@ -720,11 +743,10 @@ func (h *hub) streamStatsLoop() {
 	}
 }
 
-// demandReconcileLoop re-asserts stream_demand every 2s for every connected
-// client.  This self-corrects any demand signal that was lost due to a
-// dropped message or a race during reconnect.
+// demandReconcileLoop re-asserts stream_demand periodically for every connected
+// client.  Skips unchanged levels to avoid flooding client send queues.
 func (h *hub) demandReconcileLoop() {
-	ticker := time.NewTicker(1 * time.Second)
+	ticker := time.NewTicker(demandReconcileTick)
 	defer ticker.Stop()
 	for {
 		select {
