@@ -47,6 +47,7 @@ import (
 
 const (
 	writeWait        = 10 * time.Second
+	binaryWriteWait  = 3 * time.Second // cap stall per frame on slow WAN admin links
 	pongWait         = 60 * time.Second
 	pingPeriod       = (pongWait * 9) / 10
 	maxMessageSize   = 10 << 20 // 10 MiB
@@ -55,10 +56,11 @@ const (
 	adminClientIDLen = 36 // UUID string prefix on every binary frame
 
 	appPingInterval      = 500 * time.Millisecond
-	appPingTimeout       = 4 * time.Second
-	appPingTimeoutLive   = 12 * time.Second // extended while admin is actively watching
-	demandReconcileTick  = 5 * time.Second
-	streamStatsTick      = 500 * time.Millisecond
+	appPingTimeout       = 15 * time.Second
+	appPingTimeoutLive   = 45 * time.Second // extended while admin is actively watching
+	relayActivityGrace   = 30 * time.Second // skip app-ping eviction while video/stats flowing
+	demandReconcileTick  = 2 * time.Second
+	streamStatsTick      = 2 * time.Second // server-computed stats only (client stats not relayed)
 	maxFrameBurstPerPoke = maxWatchesPerAdmin // drain all pending latest frames per wake
 
 	// Scale limits for 500-client deployments.
@@ -190,7 +192,7 @@ func (c *clientConn) sendE2EWatcher(adminID, pubkeyB64 string) {
 		"admin_id": adminID,
 		"pubkey":   pubkeyB64,
 	})
-	c.enqueueText(msg)
+	c.enqueueTextReliable(msg)
 }
 
 // sendE2EUnwatch tells a client an admin stopped watching (drop its wrapped key).
@@ -321,6 +323,10 @@ type adminConn struct {
 	// sent once after connect. Empty until received.
 	pubkeyMu sync.RWMutex
 	pubkey   string
+
+	// Last successful outbound write (binary or text) — suppresses app-ping eviction under load.
+	relayOutMu     sync.Mutex
+	lastRelayOutAt time.Time
 }
 
 func (a *adminConn) setPubkey(b64 string) {
@@ -409,7 +415,23 @@ func (a *adminConn) handleAdminPing(ts int64) {
 	a.appPingMu.Unlock()
 }
 
+func (a *adminConn) noteRelayOut() {
+	a.relayOutMu.Lock()
+	a.lastRelayOutAt = time.Now()
+	a.relayOutMu.Unlock()
+}
+
+func (a *adminConn) relayRecentlyActive() bool {
+	a.relayOutMu.Lock()
+	at := a.lastRelayOutAt
+	a.relayOutMu.Unlock()
+	return !at.IsZero() && time.Since(at) < relayActivityGrace
+}
+
 func (a *adminConn) appPingExpired() bool {
+	if a.relayRecentlyActive() {
+		return false
+	}
 	a.appPingMu.Lock()
 	defer a.appPingMu.Unlock()
 	if a.pendingPingMs == 0 {
@@ -418,17 +440,102 @@ func (a *adminConn) appPingExpired() bool {
 	return time.Now().After(a.pingDeadline)
 }
 
+func (a *adminConn) drainPingQueue() bool {
+	for {
+		var data []byte
+		select {
+		case data = <-a.pingSend:
+		default:
+			return false
+		}
+		if data == nil {
+			return false
+		}
+		_ = a.conn.SetWriteDeadline(time.Now().Add(writeWait))
+		if err := a.conn.WriteMessage(websocket.TextMessage, data); err != nil {
+			return true
+		}
+		a.noteRelayOut()
+	}
+}
+
+// drainFrameBurst sends up to max pending latest frames without yielding to text.
+// Returns true if the connection should close (write error).
+func (a *adminConn) drainFrameBurst(max int) bool {
+	for burst := 0; burst < max; burst++ {
+		a.frameMu.Lock()
+		if len(a.latestFrames) == 0 {
+			a.frameMu.Unlock()
+			return false
+		}
+		var frame []byte
+		var sentClientID string
+		for cid, f := range a.latestFrames {
+			frame = f
+			sentClientID = cid
+			delete(a.latestFrames, cid)
+			break
+		}
+		more := len(a.latestFrames) > 0
+		if sentClientID != "" {
+			delete(a.displacementStreak, sentClientID)
+		}
+		a.frameMu.Unlock()
+
+		_ = a.conn.SetWriteDeadline(time.Now().Add(binaryWriteWait))
+		if err := a.conn.WriteMessage(websocket.BinaryMessage, frame); err != nil {
+			return true
+		}
+		a.noteRelayOut()
+		if !more {
+			return false
+		}
+	}
+	a.frameMu.Lock()
+	remaining := len(a.latestFrames) > 0
+	a.frameMu.Unlock()
+	if remaining {
+		select {
+		case a.framePoke <- struct{}{}:
+		default:
+		}
+	}
+	return false
+}
+
+func (a *adminConn) hasPendingFrames() bool {
+	a.frameMu.Lock()
+	n := len(a.latestFrames)
+	a.frameMu.Unlock()
+	return n > 0
+}
+
 // writePump serialises all writes to the admin WebSocket.
-// It handles three independent sources: text messages, video frames, and pings.
+// Video frames always drain before text so multi-watch admins stay realtime.
 func (a *adminConn) writePump() {
 	ticker := time.NewTicker(heartbeat.PingPeriod())
 	defer ticker.Stop()
 	defer a.conn.Close()
 
 	for {
+		if a.hasPendingFrames() {
+			if a.drainFrameBurst(maxFrameBurstPerPoke) {
+				return
+			}
+			continue
+		}
+
 		select {
 		case <-a.done:
 			return
+
+		case <-a.framePoke:
+			continue
+
+		case <-a.pingPoke:
+			if a.drainPingQueue() {
+				return
+			}
 
 		case msg, ok := <-a.textSend:
 			if !ok {
@@ -438,97 +545,7 @@ func (a *adminConn) writePump() {
 			if err := a.conn.WriteMessage(msg.mt, msg.data); err != nil {
 				return
 			}
-
-		case <-a.pingPoke:
-			for {
-				var data []byte
-				select {
-				case data = <-a.pingSend:
-				default:
-					data = nil
-				}
-				if data == nil {
-					break
-				}
-				_ = a.conn.SetWriteDeadline(time.Now().Add(writeWait))
-				if err := a.conn.WriteMessage(websocket.TextMessage, data); err != nil {
-					return
-				}
-			}
-
-		case <-a.framePoke:
-			// Drain every latest frame (at most maxWatchesPerAdmin entries). Each slot
-			// is already latest-only per client — send them all so multi-watch admins
-			// don't fall seconds behind while the write pump yields to text/ping.
-			for burst := 0; burst < maxFrameBurstPerPoke; burst++ {
-				a.frameMu.Lock()
-				if len(a.latestFrames) == 0 {
-					a.frameMu.Unlock()
-					break
-				}
-				var frame []byte
-				var sentClientID string
-				for cid, f := range a.latestFrames {
-					frame = f
-					sentClientID = cid
-					delete(a.latestFrames, cid)
-					break
-				}
-				if sentClientID != "" {
-					delete(a.displacementStreak, sentClientID)
-				}
-				more := len(a.latestFrames) > 0
-				a.frameMu.Unlock()
-
-				_ = a.conn.SetWriteDeadline(time.Now().Add(writeWait))
-				if err := a.conn.WriteMessage(websocket.BinaryMessage, frame); err != nil {
-					return
-				}
-				if !more {
-					break
-				}
-				// Yield to urgent text/ping after every frame so heartbeats stay fresh.
-				{
-					select {
-					case <-a.done:
-						return
-					case msg, ok := <-a.textSend:
-						if !ok {
-							return
-						}
-						_ = a.conn.SetWriteDeadline(time.Now().Add(writeWait))
-						if err := a.conn.WriteMessage(msg.mt, msg.data); err != nil {
-							return
-						}
-					case <-a.pingPoke:
-						for {
-							var data []byte
-							select {
-							case data = <-a.pingSend:
-							default:
-								data = nil
-							}
-							if data == nil {
-								break
-							}
-							_ = a.conn.SetWriteDeadline(time.Now().Add(writeWait))
-							if err := a.conn.WriteMessage(websocket.TextMessage, data); err != nil {
-								return
-							}
-						}
-					default:
-					}
-				}
-			}
-			a.frameMu.Lock()
-			remaining := len(a.latestFrames) > 0
-			a.frameMu.Unlock()
-			if remaining {
-				select {
-				case a.framePoke <- struct{}{}:
-				default:
-				}
-			}
+			a.noteRelayOut()
 
 		case <-ticker.C:
 			if a.hb.OnPingSent() {
@@ -538,6 +555,7 @@ func (a *adminConn) writePump() {
 			if err := a.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
 				return
 			}
+			a.noteRelayOut()
 		}
 	}
 }
@@ -1808,19 +1826,18 @@ func (h *hub) handleClientWS(w http.ResponseWriter, r *http.Request) {
 					}
 				}
 
-			case "stream_stats", "cursor":
-				// Route only to admins watching this client.
-				msg["client_id"] = info.ID
-				if raw, err := json.Marshal(msg); err == nil {
-					h.broadcastToWatchers(info.ID, raw)
+			case "cursor":
+				// Cursor position is embedded in every binary frame header — skip JSON
+				// relay (~60 msg/s/client) so the admin text queue cannot starve video.
+
+			case "stream_stats":
+				// Update hub state only; relay stats via publishStreamStats (2s tick)
+				// to avoid duplicate text flooding the admin write pump.
+				if fpsF, ok := msg["fps_target"].(float64); ok && fpsF > 0 {
+					h.updateClientInfo(info.ID, uint32(fpsF), 0, 0)
 				}
-				if t, _ := msg["type"].(string); t == "stream_stats" {
-					if fpsF, ok := msg["fps_target"].(float64); ok && fpsF > 0 {
-						h.updateClientInfo(info.ID, uint32(fpsF), 0, 0)
-					}
-					if qF, ok := msg["quality"].(float64); ok && qF > 0 {
-						h.updateClientInfo(info.ID, 0, uint32(qF), 0)
-					}
+				if qF, ok := msg["quality"].(float64); ok && qF > 0 {
+					h.updateClientInfo(info.ID, 0, uint32(qF), 0)
 				}
 
 			case "health":
